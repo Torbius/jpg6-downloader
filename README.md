@@ -226,4 +226,5 @@ PySide6
 
 ### License
 
-This project is provided as-is for personal use.
+This project is licensed under the [MIT License](LICENSE).  
+You are free to use, modify, and distribute it. No warranty is provided.
