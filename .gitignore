@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloaded content
+downloads/
+
+# Config with potentially sensitive data
+config/credentials.json
+config/passwords.json
+config/history.json
+
+# Logs (keep structure but not content)
+config/errors.log
+config/debug.log
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temp / test files
+*.txt.bak
+debug_response.html
