@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simp Forum JPG6 Extractor
 // @namespace    https://local.jpg6.downloader
-// @version      0.1.2
+// @version      0.2.0
 // @description  Собирает оригинальные JPG6 ссылки из темы форума и экспортирует в TXT.
 // @author       local
 // @run-at       document-end
@@ -179,6 +179,8 @@
 
   function collectCandidatesFromDocument(doc, baseUrl) {
     const out = new Set();
+    // CDN image URLs that are already covered by a /img/ anchor — suppress duplicates found via innerHTML scan
+    const suppressDirect = new Set();
     const roots = getScanRoots(doc);
 
     const attrSelectors = [
@@ -213,7 +215,10 @@
             if (parentAnchor) {
               const parentHref = toAbsoluteUrl(parentAnchor.getAttribute('href'), baseUrl);
               if (parentHref && isJpgMirror(parentHref)) {
-                // The <a> link will be collected separately — skip the img src
+                // <a> link will be collected separately — skip the img src.
+                // Also remember it so we suppress the same URL if found later via innerHTML scan.
+                const absVal = toAbsoluteUrl(val, baseUrl);
+                if (absVal) suppressDirect.add(normalizeJpgUrl(absVal));
                 continue;
               }
             }
@@ -250,7 +255,9 @@
       if (!abs) continue;
       const unwrapped = unwrapForumRedirect(abs, baseUrl);
       if (!isJpgMirror(unwrapped)) continue;
-      normalized.add(normalizeJpgUrl(unwrapped));
+      const norm = normalizeJpgUrl(unwrapped);
+      if (suppressDirect.has(norm)) continue; // duplicate of a /img/ anchor already collected
+      normalized.add(norm);
     }
 
     return normalized;
@@ -265,9 +272,15 @@
   }
 
   function getThreadPageUrlsFromDocument(doc, currentUrl) {
-    const urls = new Set([new URL(currentUrl, location.href).href]);
-    const currentKey = threadKey(currentUrl);
+    const baseOrigin = new URL(currentUrl).origin;
+    const baseKey = threadKey(currentUrl);
+    let maxPage = 1;
+    let pathPattern = null; // 'path' (/page-N) or 'query' (?page=N)
+    let basePath = '';
 
+    // Scan all <a> links to find the maximum page number and detect URL pattern.
+    // XenForo shows smart pagination (e.g. 1 … 60 61 [62] 63 64 … 100),
+    // so we find maxPage and then generate ALL page URLs from 1 to maxPage.
     for (const a of doc.querySelectorAll('a[href]')) {
       const href = a.getAttribute('href');
       const full = toAbsoluteUrl(href, currentUrl);
@@ -275,26 +288,44 @@
 
       try {
         const u = new URL(full);
-        if (u.origin !== location.origin) continue;
+        if (u.origin !== baseOrigin) continue;
+        if (threadKey(full) !== baseKey) continue;
 
-        if (threadKey(full) === currentKey) {
-          urls.add(u.href);
-          continue;
-        }
-
-        if (u.pathname === new URL(currentUrl).pathname && u.searchParams.has('page')) {
-          urls.add(u.href);
+        const pageNum = pageNumber(full);
+        if (pageNum > maxPage) {
+          maxPage = pageNum;
+          if (u.pathname.match(/\/page-\d+\/?$/i)) {
+            pathPattern = 'path';
+            basePath = u.pathname.replace(/\/page-\d+\/?$/i, '/');
+          } else if (u.searchParams.has('page')) {
+            pathPattern = 'query';
+            basePath = u.pathname;
+          }
         }
       } catch {
         // ignore parse errors
       }
     }
 
-    return Array.from(urls).sort((a, b) => {
-      const pa = pageNumber(a);
-      const pb = pageNumber(b);
-      return pa - pb;
-    });
+    if (maxPage === 1 || !pathPattern) {
+      // Single page or unrecognised pagination — just return current page
+      return [new URL(currentUrl).href];
+    }
+
+    // Generate all page URLs
+    const urls = [];
+    for (let p = 1; p <= maxPage; p++) {
+      if (pathPattern === 'path') {
+        urls.push(p === 1
+          ? `${baseOrigin}${basePath}`
+          : `${baseOrigin}${basePath}page-${p}`);
+      } else {
+        urls.push(p === 1
+          ? `${baseOrigin}${basePath}`
+          : `${baseOrigin}${basePath}?page=${p}`);
+      }
+    }
+    return urls;
   }
 
   function pageNumber(urlString) {
@@ -334,13 +365,16 @@
     const pageUrls = getThreadPageUrlsFromDocument(document, location.href);
     let totalAdded = 0;
 
+    setStatus(`Найдено страниц: ${pageUrls.length}. Сканирую...`);
+    await sleep(50);
+
     for (let i = 0; i < pageUrls.length; i += 1) {
       const pageUrl = pageUrls[i];
-      setStatus(`Скан страницы ${i + 1}/${pageUrls.length}...`);
+      setStatus(`Стр. ${i + 1} / ${pageUrls.length}...`);
 
       try {
         let doc = document;
-        if (i > 0 || pageUrl !== location.href) {
+        if (pageUrl !== location.href) {
           doc = await fetchDocument(pageUrl);
           await sleep(400);
         }
@@ -349,8 +383,11 @@
         const before = state.links.size;
         for (const link of found) state.links.add(link);
         totalAdded += state.links.size - before;
+        renderCount();
       } catch (err) {
-        console.error('[JPG6 Extractor] scan error:', err);
+        console.error('[JPG6 Extractor] scan error on', pageUrl, ':', err);
+        setStatus(`Ошибка стр. ${i + 1}: ${err.message}`);
+        await sleep(200);
       }
     }
 
