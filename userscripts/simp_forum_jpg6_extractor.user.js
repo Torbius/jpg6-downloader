@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simp Forum JPG6 Extractor
 // @namespace    https://local.jpg6.downloader
-// @version      0.2.0
+// @version      0.3.0
 // @description  Собирает оригинальные JPG6 ссылки из темы форума и экспортирует в TXT.
 // @author       local
 // @run-at       document-end
@@ -158,6 +158,26 @@
     }
   }
 
+  // Classify a jpg-mirror URL into one of three categories:
+  // 'img_page'        — /img/TOKEN  (resolves to a single image via oEmbed)
+  // 'direct_image'    — direct CDN file URL (.jpg/.png/etc.)
+  // 'album_or_profile'— album, user profile, all-albums page
+  // null              — not a jpg-mirror URL
+  function classifyJpgLink(urlString) {
+    if (!isJpgMirror(urlString)) return null;
+    try {
+      const u = new URL(urlString);
+      if (/\.(jpg|jpeg|png|webp|gif|bmp|avif|jfif)(\?|$)/i.test(u.pathname)) {
+        return 'direct_image';
+      }
+      const segs = u.pathname.split('/').filter(Boolean);
+      if (segs.length >= 1 && segs[0] === 'img') return 'img_page';
+      return 'album_or_profile';
+    } catch {
+      return null;
+    }
+  }
+
   function getScanRoots(doc) {
     const roots = Array.from(doc.querySelectorAll(POST_ROOT_SELECTOR))
       .filter((el) => !el.closest(NOISE_SELECTOR));
@@ -178,89 +198,79 @@
   }
 
   function collectCandidatesFromDocument(doc, baseUrl) {
-    const out = new Set();
-    // CDN image URLs that are already covered by a /img/ anchor — suppress duplicates found via innerHTML scan
-    const suppressDirect = new Set();
+    const allLinks = new Set();
     const roots = getScanRoots(doc);
 
-    const attrSelectors = [
-      ['a[href]', 'href'],
-      ['img[src]', 'src'],
-      ['img[data-src]', 'data-src'],
-      ['img[data-url]', 'data-url'],
-      ['img[data-full]', 'data-full'],
-      ['source[srcset]', 'srcset'],
-      ['*[data-href]', 'data-href'],
-      ['*[data-url]', 'data-url'],
-    ];
+    for (const root of roots) {
+      // Per-post buckets
+      const imgPageLinks = new Set();    // jpg6.su/img/TOKEN — preferred
+      const albumLinks = new Set();      // albums / profiles — always included
+      const directCdnLinks = new Set();  // raw CDN image URLs — only if no /img/ links
 
-    for (const [selector, attr] of attrSelectors) {
-      for (const root of roots) {
+      function processRaw(raw) {
+        if (!raw || typeof raw !== 'string') return;
+        const abs = toAbsoluteUrl(raw.trim(), baseUrl);
+        if (!abs) return;
+        const unwrapped = unwrapForumRedirect(abs, baseUrl);
+        const norm = normalizeJpgUrl(unwrapped);
+        const kind = classifyJpgLink(norm);
+        if (kind === 'img_page') imgPageLinks.add(norm);
+        else if (kind === 'direct_image') directCdnLinks.add(norm);
+        else if (kind === 'album_or_profile') albumLinks.add(norm);
+      }
+
+      // DOM attribute scan
+      const attrMap = [
+        ['a[href]', 'href'],
+        ['img[src]', 'src'],
+        ['img[data-src]', 'data-src'],
+        ['img[data-url]', 'data-url'],
+        ['img[data-full]', 'data-full'],
+        ['*[data-href]', 'data-href'],
+        ['*[data-url]', 'data-url'],
+      ];
+      for (const [selector, attr] of attrMap) {
         for (const el of root.querySelectorAll(selector)) {
           if (shouldSkipElement(el)) continue;
-
           const val = el.getAttribute(attr);
-          if (!val) continue;
-
-          if (attr === 'srcset') {
-            const first = val.split(',')[0]?.trim().split(/\s+/)[0];
-            if (first) out.add(first);
-            continue;
-          }
-
-          // Skip img src/data-src when the image is wrapped in a jpg-mirror <a href>
-          // to avoid collecting both the direct URL and the /img/ page link for the same file.
-          if (attr === 'src' || attr === 'data-src' || attr === 'data-url' || attr === 'data-full') {
-            const parentAnchor = el.closest('a[href]');
-            if (parentAnchor) {
-              const parentHref = toAbsoluteUrl(parentAnchor.getAttribute('href'), baseUrl);
-              if (parentHref && isJpgMirror(parentHref)) {
-                // <a> link will be collected separately — skip the img src.
-                // Also remember it so we suppress the same URL if found later via innerHTML scan.
-                const absVal = toAbsoluteUrl(val, baseUrl);
-                if (absVal) suppressDirect.add(normalizeJpgUrl(absVal));
-                continue;
-              }
-            }
-          }
-
-          out.add(val);
+          if (val) processRaw(val);
         }
       }
-    }
+      for (const el of root.querySelectorAll('source[srcset]')) {
+        if (shouldSkipElement(el)) continue;
+        const first = (el.getAttribute('srcset') || '').split(',')[0]?.trim().split(/\s+/)[0];
+        if (first) processRaw(first);
+      }
 
-    for (const root of roots) {
-      const text = root.innerText || '';
-      if (!text) continue;
-      const matches = text.match(URL_TEXT_RE) || [];
-      for (const m of matches) out.add(m);
+      // Text and innerHTML scan
+      for (const m of ((root.innerText || '').match(URL_TEXT_RE) || [])) processRaw(m);
+      for (const m of ((root.innerHTML || '').match(URL_IN_HTML_RE) || [])) processRaw(decodeMaybeUrl(m));
 
-      const html = root.innerHTML || '';
-      if (html) {
-        const htmlMatches = html.match(URL_IN_HTML_RE) || [];
-        for (const m of htmlMatches) out.add(decodeMaybeUrl(m));
+      // Preference rule: if this post has /img/ page links, ignore its raw CDN links
+      // (they are the same images, just duplicate embeds by different users in the thread).
+      // If the post has NO /img/ links, keep the raw CDN links (standalone embeds).
+      for (const l of albumLinks) allLinks.add(l);
+      for (const l of imgPageLinks) allLinks.add(l);
+      if (imgPageLinks.size === 0) {
+        for (const l of directCdnLinks) allLinks.add(l);
       }
     }
 
+    // Script tags are page-global (not per-post).
+    // Only collect /img/ and album links from scripts; skip bare CDN URLs.
     for (const scriptEl of doc.querySelectorAll('script')) {
       const s = scriptEl.textContent || '';
-      if (!s) continue;
-      const matches = s.match(URL_IN_HTML_RE) || [];
-      for (const m of matches) out.add(decodeMaybeUrl(m));
+      for (const m of (s.match(URL_IN_HTML_RE) || [])) {
+        const abs = toAbsoluteUrl(decodeMaybeUrl(m), baseUrl);
+        if (!abs) continue;
+        const unwrapped = unwrapForumRedirect(abs, baseUrl);
+        const norm = normalizeJpgUrl(unwrapped);
+        const kind = classifyJpgLink(norm);
+        if (kind === 'img_page' || kind === 'album_or_profile') allLinks.add(norm);
+      }
     }
 
-    const normalized = new Set();
-    for (const candidate of out) {
-      const abs = toAbsoluteUrl(candidate, baseUrl);
-      if (!abs) continue;
-      const unwrapped = unwrapForumRedirect(abs, baseUrl);
-      if (!isJpgMirror(unwrapped)) continue;
-      const norm = normalizeJpgUrl(unwrapped);
-      if (suppressDirect.has(norm)) continue; // duplicate of a /img/ anchor already collected
-      normalized.add(norm);
-    }
-
-    return normalized;
+    return allLinks;
   }
 
   function threadKey(urlString) {
