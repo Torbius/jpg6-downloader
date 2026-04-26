@@ -206,6 +206,19 @@
             continue;
           }
 
+          // Skip img src/data-src when the image is wrapped in a jpg-mirror <a href>
+          // to avoid collecting both the direct URL and the /img/ page link for the same file.
+          if (attr === 'src' || attr === 'data-src' || attr === 'data-url' || attr === 'data-full') {
+            const parentAnchor = el.closest('a[href]');
+            if (parentAnchor) {
+              const parentHref = toAbsoluteUrl(parentAnchor.getAttribute('href'), baseUrl);
+              if (parentHref && isJpgMirror(parentHref)) {
+                // The <a> link will be collected separately — skip the img src
+                continue;
+              }
+            }
+          }
+
           out.add(val);
         }
       }

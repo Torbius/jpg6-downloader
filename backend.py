@@ -188,6 +188,7 @@ class DownloadBackend:
         self.progress_cb = progress_cb or (lambda done, total: None)
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
+        self._batch_name = None
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -430,7 +431,10 @@ class DownloadBackend:
             if not target_url or target_url in tried_oembed_urls:
                 return []
             tried_oembed_urls.add(target_url)
-            query_url = "https://jpg6.su/oembed/?url=" + requests.utils.quote(target_url, safe="") + "&format=json"
+            # Use the target URL's own host for oEmbed (mirrors have their own endpoint)
+            parsed_target = urlparse(target_url)
+            oembed_base = f"{parsed_target.scheme}://{parsed_target.netloc}/oembed/"
+            query_url = oembed_base + "?url=" + requests.utils.quote(target_url, safe="") + "&format=json"
             try:
                 oembed_resp = _request_with_retry(self.session, query_url, timeout=15)
                 data = oembed_resp.json()
@@ -658,12 +662,14 @@ class DownloadBackend:
         url_type = classify_url(url)
 
         if url_type == "direct_image":
-            return "direct_images", [{"url": url, "filename": filename_from_url(url)}]
+            folder = self._batch_name or "direct_images"
+            return folder, [{"url": url, "filename": filename_from_url(url)}]
 
         if url_type == "image_page":
             imgs = self._collect_single_image_page(url)
             self._log_debug("batch_image_page_result", page_url=url, found_total=len(imgs), first=(imgs[0]["url"] if imgs else ""))
-            return "image_pages", imgs
+            folder = self._batch_name or "image_pages"
+            return folder, imgs
 
         if url_type == "user_profile":
             images = self._collect_profile_images(url)
@@ -698,7 +704,8 @@ class DownloadBackend:
             self.logger(f"❌ Ошибка: {e}")
             return "error", []
 
-    def run_batch(self, urls):
+    def run_batch(self, urls, batch_name=None):
+        self._batch_name = sanitize_dirname(batch_name) if batch_name else None
         clean_urls = []
         seen_urls = set()
         for raw in urls:
