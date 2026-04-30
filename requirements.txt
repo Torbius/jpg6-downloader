@@ -1,3 +1,5 @@
 requests
 beautifulsoup4
 PySide6
+customtkinter
+Pillow
