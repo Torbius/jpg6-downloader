@@ -1,4 +1,5 @@
 {
-  "base_dir": "C:/code/jpg6_downloader/downloads",
-  "workers": 6
+  "base_dir": "C:/code/jpg6_downloader/downloads/Новая папка",
+  "workers": 6,
+  "lang": "ru"
 }

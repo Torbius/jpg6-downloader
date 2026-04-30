@@ -37,6 +37,20 @@ def thumb_to_original(url):
     return url.replace(".th.", ".").replace(".md.", ".")
 
 
+def original_to_thumb(url):
+    """Return .th. thumbnail URL for a CDN image URL, or original if not applicable."""
+    try:
+        p = urlparse(url)
+        base, ext = os.path.splitext(p.path)
+        if ext.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'):
+            from urllib.parse import urlunparse
+            new_path = f"{base}.th{ext}"
+            return urlunparse(p._replace(path=new_path))
+    except Exception:
+        pass
+    return url
+
+
 def sanitize_filename(name, fallback="image.jpg"):
     if not name:
         name = fallback
@@ -179,6 +193,7 @@ class DownloadBackend:
         status_cb=None,
         item_status_cb=None,
         progress_cb=None,
+        image_downloaded_cb=None,
     ):
         self.base_dir = os.path.normpath(base_dir or os.path.join(SCRIPT_DIR, "downloads"))
         self.workers = int(max(1, workers))
@@ -186,6 +201,7 @@ class DownloadBackend:
         self.status_cb = status_cb or (lambda msg: None)
         self.item_status_cb = item_status_cb or (lambda url, status: None)
         self.progress_cb = progress_cb or (lambda done, total: None)
+        self.image_downloaded_cb = image_downloaded_cb or (lambda path: None)
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._batch_name = None
@@ -328,7 +344,10 @@ class DownloadBackend:
                     if not filename:
                         filename = obj.get("filename")
                     if img_url:
-                        images.append({"url": thumb_to_original(img_url), "filename": filename or f"{data_id}.jpg"})
+                        raw_url = str(img_url)
+                        full_url = thumb_to_original(raw_url)
+                        thumb_url = raw_url if ".th." in raw_url else original_to_thumb(full_url)
+                        images.append({"url": full_url, "thumb_url": thumb_url, "filename": filename or f"{data_id}.jpg"})
                         found += 1
                 except (json.JSONDecodeError, KeyError, TypeError):
                     continue
@@ -379,7 +398,10 @@ class DownloadBackend:
                     if not filename:
                         filename = obj.get("filename")
                     if img_url:
-                        images.append({"url": thumb_to_original(img_url), "filename": filename or f"{data_id}.jpg"})
+                        raw_url = str(img_url)
+                        full_url = thumb_to_original(raw_url)
+                        thumb_url = raw_url if ".th." in raw_url else original_to_thumb(full_url)
+                        images.append({"url": full_url, "thumb_url": thumb_url, "filename": filename or f"{data_id}.jpg"})
                         found += 1
                 except (json.JSONDecodeError, KeyError, TypeError):
                     continue
@@ -442,6 +464,7 @@ class DownloadBackend:
                 oembed_url = query_url
                 oembed_candidate_total += len([x for x in oembed_candidates if x])
 
+                thumb_raw = data.get("thumbnail_url", "")
                 found = []
                 seen_oembed = set()
                 for raw in oembed_candidates:
@@ -452,7 +475,8 @@ class DownloadBackend:
                         continue
                     seen_oembed.add(full)
                     if is_content_image_url(full):
-                        found.append({"url": full, "filename": filename_from_url(full)})
+                        thumb_url = str(thumb_raw) if thumb_raw else original_to_thumb(full)
+                        found.append({"url": full, "thumb_url": thumb_url, "filename": filename_from_url(full)})
                         oembed_valid_total += 1
                 return found
             except Exception:
@@ -545,7 +569,7 @@ class DownloadBackend:
         )
         return images
 
-    def _download_images(self, images, album_title):
+    def _download_images(self, images, album_title, global_offset=0, global_total=None):
         safe_title = sanitize_dirname(album_title, fallback="album")
         save_dir = os.path.join(self.base_dir, safe_title)
 
@@ -569,6 +593,7 @@ class DownloadBackend:
             existing = set()
 
         total = len(images)
+        effective_total = global_total if global_total is not None else total
         if total == 0:
             return {"downloaded": 0, "skipped": 0, "errors": 0}
 
@@ -593,7 +618,7 @@ class DownloadBackend:
                 if filename in existing:
                     skipped += 1
                     completed += 1
-                    self.progress_cb(completed, total)
+                    self.progress_cb(global_offset + completed, effective_total)
                     return
 
             time.sleep(DOWNLOAD_DELAY)
@@ -627,8 +652,9 @@ class DownloadBackend:
                         downloaded += 1
                         completed += 1
                         existing.add(filename)
-                        self.progress_cb(completed, total)
+                        self.progress_cb(global_offset + completed, effective_total)
                     self.logger(f"✅ [{idx}/{total}] {filename}")
+                    self.image_downloaded_cb(filepath)
                     last_err = None
                     break
                 except Exception as e:
@@ -642,7 +668,7 @@ class DownloadBackend:
                 with self._lock:
                     errors += 1
                     completed += 1
-                    self.progress_cb(completed, total)
+                    self.progress_cb(global_offset + completed, effective_total)
                 self.logger(f"❌ [{idx}/{total}] {last_err}")
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -704,6 +730,104 @@ class DownloadBackend:
             self.logger(f"❌ Ошибка: {e}")
             return "error", []
 
+    def scan_for_preview(self, urls, batch_name=None, image_found_cb=None):
+        """Resolve all URLs to image lists WITHOUT downloading.
+        Calls image_found_cb(album_title, img_dict) for each resolved image.
+        Returns list of (album_title, images).
+        """
+        if image_found_cb is None:
+            image_found_cb = lambda title, img: None
+
+        self._batch_name = sanitize_dirname(batch_name) if batch_name else None
+
+        seen_urls = set()
+        clean_urls = []
+        for raw in urls:
+            if not raw:
+                continue
+            u = raw.strip()
+            if not u or not u.startswith("http") or should_skip_batch_url(u):
+                continue
+            if u in seen_urls:
+                continue
+            seen_urls.add(u)
+            clean_urls.append(u)
+
+        total = len(clean_urls)
+        if total == 0:
+            self.status_cb("Нет валидных URL")
+            return []
+
+        results = []
+        for i, url in enumerate(clean_urls, 1):
+            if self.is_cancelled():
+                break
+            self.status_cb(f"Сканирую {i}/{total}…")
+            self.logger(f"🔍 [{i}/{total}] {url}")
+            try:
+                album_title, images = self._resolve_images_for_url(url)
+                results.append((album_title, images))
+                for img in images:
+                    if self.is_cancelled():
+                        break
+                    image_found_cb(album_title, img)
+            except Exception as e:
+                self._log_exception(e, "scan_for_preview", f"url={url}")
+                self.logger(f"❌ Ошибка при сканировании: {e}")
+
+        total_found = sum(len(imgs) for _, imgs in results)
+        self.status_cb(f"Сканирование завершено: {total_found} изображений")
+        return results
+
+    def download_selected(self, selected):
+        """Download from a list of (album_title, img_dict) pairs.
+        Groups by album_title for folder organisation.
+        """
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        order = []
+        for album_title, img in selected:
+            if album_title not in grouped:
+                order.append(album_title)
+            grouped[album_title].append(img)
+
+        global_total = len(selected)
+        global_offset = 0
+        total_downloaded = 0
+        total_skipped = 0
+        total_errors = 0
+
+        for album_title in order:
+            images = grouped[album_title]
+            if self.is_cancelled():
+                self.logger("⛔ Остановлено")
+                break
+            self.logger(f"\n{'=' * 50}")
+            self.logger(f"📁 {album_title} — {len(images)} фото")
+            stats = self._download_images(
+                images, album_title,
+                global_offset=global_offset,
+                global_total=global_total,
+            )
+            global_offset += len(images)
+            total_downloaded += stats["downloaded"]
+            total_skipped += stats["skipped"]
+            total_errors += stats["errors"]
+
+        summary = {
+            "albums": len(order),
+            "downloaded": total_downloaded,
+            "skipped": total_skipped,
+            "errors": total_errors,
+            "cancelled": self.is_cancelled(),
+        }
+        self.status_cb("Finished" if not self.is_cancelled() else "Cancelled")
+        self.logger(
+            f"🎉 Готово! Альбомов: {summary['albums']}, скачано: {summary['downloaded']}, "
+            f"пропущено: {summary['skipped']}, ошибок: {summary['errors']}"
+        )
+        return summary
+
     def run_batch(self, urls, batch_name=None):
         self._batch_name = sanitize_dirname(batch_name) if batch_name else None
         clean_urls = []
@@ -724,11 +848,13 @@ class DownloadBackend:
             self.status_cb("No valid URLs")
             return {"albums": 0, "downloaded": 0, "skipped": 0, "errors": 0}
 
-        self.status_cb(f"Running batch: {total}")
+        self.status_cb(f"Анализ {total} URL...")
         total_downloaded = 0
         total_skipped = 0
         total_errors = 0
 
+        # Phase 1: Resolve all URLs → collect (url, title, images)
+        resolved = []
         for i, url in enumerate(clean_urls, 1):
             if self.is_cancelled():
                 self.logger("⛔ Остановлено")
@@ -736,25 +862,36 @@ class DownloadBackend:
 
             self.item_status_cb(url, "analyzing")
             self.logger(f"\n{'=' * 50}")
-            self.logger(f"📦 Альбом {i}/{total}")
+            self.logger(f"📦 URL {i}/{total}")
             self.logger(f"🔗 {url}")
 
             album_title, images = self._resolve_images_for_url(url)
-
-            if self.is_cancelled():
-                break
-
+            resolved.append((url, album_title, images))
             if not images:
                 self.item_status_cb(url, "empty")
                 self.logger("⚠ Нет изображений, пропускаю")
-                continue
 
-            self.item_status_cb(url, "downloading")
-            stats = self._download_images(images, album_title)
-            total_downloaded += stats["downloaded"]
-            total_skipped += stats["skipped"]
-            total_errors += stats["errors"]
-            self.item_status_cb(url, "done")
+        # Phase 2: Download with true global progress
+        if not self.is_cancelled():
+            global_total = sum(len(imgs) for _, _, imgs in resolved)
+            global_offset = 0
+            for url, album_title, images in resolved:
+                if self.is_cancelled():
+                    self.logger("⛔ Остановлено")
+                    break
+                if not images:
+                    continue
+                self.item_status_cb(url, "downloading")
+                stats = self._download_images(
+                    images, album_title,
+                    global_offset=global_offset,
+                    global_total=global_total,
+                )
+                global_offset += len(images)
+                total_downloaded += stats["downloaded"]
+                total_skipped += stats["skipped"]
+                total_errors += stats["errors"]
+                self.item_status_cb(url, "done")
 
         summary = {
             "albums": total,
