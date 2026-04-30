@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Downloaded files (mount as volume at runtime)
+downloads/
+
+# Config (mount as volume at runtime)
+config/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docker itself
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
