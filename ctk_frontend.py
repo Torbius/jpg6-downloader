@@ -385,15 +385,16 @@ class ThumbnailCard(ctk.CTkFrame):
 
     # ── public API ────────────────────────────────────────────────────────────
     def set_image(self, pil_img: Image.Image):
-        """Update card with real thumbnail, preserving aspect ratio."""
+        """Update card with real thumbnail, letterboxed to fixed size (no reflow)."""
         self._pil_image = pil_img
+        s = self.thumb_size
         copy = pil_img.copy()
-        copy.thumbnail((self.thumb_size, self.thumb_size), Image.LANCZOS)
+        copy.thumbnail((s, s), Image.LANCZOS)
         w, h = copy.size
-        # Use actual image dimensions — avoids stretching
-        self._ctk_image = ctk.CTkImage(light_image=copy, dark_image=copy, size=(w, h))
+        lb = Image.new("RGB", (s, s), self._PLACEHOLDER_COLOR)
+        lb.paste(copy, ((s - w) // 2, (s - h) // 2))
+        self._ctk_image = ctk.CTkImage(light_image=lb, dark_image=lb, size=(s, s))
         self._img_label.configure(image=self._ctk_image)
-        self._name_label.configure(wraplength=w)
 
     def set_checked(self, value: bool):
         self._check_var.set(value)
@@ -431,14 +432,28 @@ class GalleryFrame(ctk.CTkScrollableFrame):
         self.thumb_size = thumb_size
         self._cards: list[ThumbnailCard] = []
         self._cols  = 5
+        self._canvas_w: int = 0
         self._relayout_pending = False
-        self.bind("<Configure>", self._on_configure)
-        # bind scroll on the outer frame as well
+        # increase scroll speed: each "unit" = 8px, scroll 5 units per notch
+        self._parent_canvas.configure(yscrollincrement=8)
+        # NOTE: do NOT bind _parent_canvas.<Configure> here — we override
+        # _fit_frame_dimensions_to_canvas() below so the parent binding still works.
         self.bind("<MouseWheel>", self._on_scroll)
 
     # ── mousewheel scroll fix ─────────────────────────────────────────────────
+    def _fit_frame_dimensions_to_canvas(self, event):
+        """Override CTkScrollableFrame hook that fires on canvas <Configure>.
+        We piggyback here to get the true canvas viewport width without
+        replacing the parent's binding (which constrains the inner frame width).
+        """
+        super()._fit_frame_dimensions_to_canvas(event)
+        self._canvas_w = event.width
+        if not self._relayout_pending:
+            self._relayout_pending = True
+            self.after(80, self._deferred_relayout)
+
     def _on_scroll(self, event):
-        self._parent_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._parent_canvas.yview_scroll(int(-1 * (event.delta / 120)) * 5, "units")
 
     def _bind_scroll_recursive(self, widget):
         """Bind mousewheel on all descendants so child widgets don't eat scroll."""
@@ -484,24 +499,27 @@ class GalleryFrame(ctk.CTkScrollableFrame):
         self._recompute_layout()
 
     # ── responsive layout ─────────────────────────────────────────────────────
-    def _on_configure(self, event=None):
-        if not self._relayout_pending:
-            self._relayout_pending = True
-            self.after(100, self._deferred_relayout)
-
     def _deferred_relayout(self):
         self._relayout_pending = False
         self._recompute_layout()
 
     def _recompute_layout(self):
-        w = self.winfo_width()
+        w = self._canvas_w or self._parent_canvas.winfo_width()
         if w < 40:
+            self.after(100, self._recompute_layout)  # retry when layout is ready
             return
-        card_w   = self.thumb_size + 28
-        new_cols = max(1, (w - 16) // card_w)
+        # event.width is in PHYSICAL pixels (DPI-scaled), but thumb_size is a
+        # LOGICAL value. We must scale the card slot to physical pixels too,
+        # otherwise on 125%/150% displays we overestimate the column count.
+        card_slot_logical = self.thumb_size + 16 + 12  # thumb + card pad + grid padx
+        card_slot_physical = self._apply_widget_scaling(card_slot_logical)
+        new_cols  = max(1, int(w // card_slot_physical))
         if new_cols != self._cols:
             self._cols = new_cols
             self._relayout()
+
+    def scroll_to_top(self):
+        self._parent_canvas.yview_moveto(0)
 
     def _relayout(self):
         for i, card in enumerate(self._cards):
@@ -524,6 +542,8 @@ class DownloaderCtkWindow(ctk.CTk):
         self._queued_urls: list[str] = []
         self._thumb_size: int        = 120
         self._log_job_id             = None
+        self._pending_cards: list    = []
+        self._flush_job: str | None  = None
 
         self.title("JPG6 Downloader Pro")
         self.geometry("1380x880")
@@ -999,7 +1019,12 @@ class DownloaderCtkWindow(ctk.CTk):
                 btn.configure(fg_color=C_CARD, text_color=C_TEXT)
 
     def _clear_gallery(self):
+        if self._flush_job:
+            self.after_cancel(self._flush_job)
+            self._flush_job = None
+        self._pending_cards.clear()
         self.gallery.clear()
+        self.gallery.scroll_to_top()
         self._btn_start.configure(state="disabled")
 
     # ── Scan workflow ─────────────────────────────────────────────────────────
@@ -1034,13 +1059,23 @@ class DownloaderCtkWindow(ctk.CTk):
         self._worker.start()
 
     def _on_image_found(self, album_title, url, filename, thumb_url):
-        card = self.gallery.add_card(album_title, url, filename, thumb_url)
-        CdnThumbnailLoader(
-            thumb_url or url, self._thumb_size,
-            on_loaded=lambda img, _c=card: self.after(
-                0, lambda i=img, c=_c: c.set_image(i),
-            ),
-        ).start()
+        self._pending_cards.append((album_title, url, filename, thumb_url))
+        if self._flush_job is None:
+            self._flush_job = self.after(80, self._flush_cards)
+
+    def _flush_cards(self):
+        self._flush_job = None
+        batch, self._pending_cards = self._pending_cards[:25], self._pending_cards[25:]
+        for album_title, url, filename, thumb_url in batch:
+            card = self.gallery.add_card(album_title, url, filename, thumb_url)
+            CdnThumbnailLoader(
+                thumb_url or url, self._thumb_size,
+                on_loaded=lambda img, _c=card: self.after(
+                    0, lambda i=img, c=_c: c.set_image(i),
+                ),
+            ).start()
+        if self._pending_cards:
+            self._flush_job = self.after(80, self._flush_cards)
 
     def _on_scan_finished(self, count: int):
         self._progress.stop()
