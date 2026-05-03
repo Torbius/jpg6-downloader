@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -79,6 +80,28 @@ def format_size(n: int) -> str:
     if n < 1_073_741_824:
         return f"{n / 1_048_576:.1f} MB"
     return f"{n / 1_073_741_824:.2f} GB"
+
+
+def file_md5(path: str) -> str:
+    """Return MD5 hex digest of a file."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _unique_filename(base_name: str, existing: set) -> str:
+    """Return base_name, or base_name (N).ext if base_name is already taken."""
+    if base_name not in existing:
+        return base_name
+    stem, ext = os.path.splitext(base_name)
+    i = 1
+    while True:
+        candidate = f"{stem} ({i}){ext}"
+        if candidate not in existing:
+            return candidate
+        i += 1
 
 
 def sanitize_filename(name, fallback="image.jpg"):
@@ -706,6 +729,15 @@ class DownloadBackend:
             self._log_exception(e, "_download_images:listdir", f"save_dir={save_dir}")
             existing = set()
 
+        # Build hash index of already-downloaded files for content-based dedup
+        existing_hashes: dict[str, str] = {}  # md5 hex → filename
+        for _name in list(existing):
+            _fpath = os.path.join(save_dir, _name)
+            try:
+                existing_hashes[file_md5(_fpath)] = _name
+            except Exception:
+                pass
+
         total = len(images)
         effective_total = global_total if global_total is not None else total
         if total == 0:
@@ -743,14 +775,6 @@ class DownloadBackend:
             fallback_name = os.path.basename(urlparse(img_url).path) or f"image_{idx}.jpg"
             filename = sanitize_filename(img.get("filename") or fallback_name, fallback=f"image_{idx}.jpg")
 
-            with self._lock:
-                if filename in existing:
-                    skipped += 1
-                    completed += 1
-                    self.progress_cb(global_offset + completed, effective_total)
-                    self.logger(f"⏭ [{idx}/{total}] {filename}  (уже скачан)")
-                    return
-
             time.sleep(DOWNLOAD_DELAY)
             last_err = None
             for attempt in range(MAX_RETRIES + 1):
@@ -770,14 +794,17 @@ class DownloadBackend:
                     content_length = int(r.headers.get("Content-Length", 0) or 0)
                     self.file_progress_cb(filename, 0, content_length)
 
-                    filepath = os.path.join(save_dir, filename)
+                    # Download to a temp file; compute MD5 inline
+                    filepath_tmp = os.path.join(save_dir, f"{filename}.{idx}.tmp")
                     bytes_written = 0
                     last_cb_time = 0.0
-                    with open(filepath, "wb") as f:
+                    h = hashlib.md5()
+                    with open(filepath_tmp, "wb") as f:
                         for chunk in r.iter_content(65536):
                             if self.is_cancelled():
                                 break
                             f.write(chunk)
+                            h.update(chunk)
                             bytes_written += len(chunk)
                             if content_length > 0:
                                 now = time.monotonic()
@@ -787,24 +814,55 @@ class DownloadBackend:
 
                     if self.is_cancelled():
                         try:
-                            os.remove(filepath)
+                            os.remove(filepath_tmp)
                         except OSError:
                             pass
                         return
 
+                    file_hash = h.hexdigest()
                     size_str = format_size(bytes_written)
+                    final_filename = None
+                    filepath = None
+
                     with self._lock:
-                        downloaded += 1
-                        completed += 1
-                        total_bytes += bytes_written
-                        existing.add(filename)
-                        self.progress_cb(global_offset + completed, effective_total)
-                    self.logger(f"✅ [{idx}/{total}] {filename}  •  {size_str}")
-                    self.image_downloaded_cb(filepath)
+                        if file_hash in existing_hashes:
+                            # Identical content already on disk — true duplicate, skip
+                            skipped += 1
+                            completed += 1
+                            self.progress_cb(global_offset + completed, effective_total)
+                        else:
+                            # New content: resolve name (handle collision by appending (N))
+                            final_filename = _unique_filename(filename, existing)
+                            filepath = os.path.join(save_dir, final_filename)
+                            os.rename(filepath_tmp, filepath)
+                            downloaded += 1
+                            completed += 1
+                            total_bytes += bytes_written
+                            existing.add(final_filename)
+                            existing_hashes[file_hash] = final_filename
+                            self.progress_cb(global_offset + completed, effective_total)
+
+                    if final_filename is None:
+                        # Was a duplicate — delete temp
+                        try:
+                            os.remove(filepath_tmp)
+                        except OSError:
+                            pass
+                        self.logger(f"⏭ [{idx}/{total}] {filename}  (уже скачан)")
+                    else:
+                        if final_filename != filename:
+                            self.logger(f"✅ [{idx}/{total}] {filename} → {final_filename}  •  {size_str}")
+                        else:
+                            self.logger(f"✅ [{idx}/{total}] {final_filename}  •  {size_str}")
+                        self.image_downloaded_cb(filepath)
                     last_err = None
                     break
                 except Exception as e:
                     last_err = e
+                    try:
+                        os.remove(os.path.join(save_dir, f"{filename}.{idx}.tmp"))
+                    except OSError:
+                        pass
                     if attempt < MAX_RETRIES:
                         delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                         time.sleep(delay)
