@@ -408,11 +408,11 @@ class DownloadBackend:
             album_title = title_el.get_text(strip=True) if title_el else "bunkr_album"
 
             for card in soup.select("div.theItem"):
-                # Only download image files — skip video/pdf etc.
+                # Skip video files; allow images (type-Image) and archives/files (type-File)
                 type_span = card.select_one("span[class*='type-']")
                 if type_span:
                     span_classes = " ".join(type_span.get("class", []))
-                    if "type-Image" not in span_classes:
+                    if "type-Video" in span_classes:
                         continue
 
                 # Filename (visible label)
@@ -441,7 +441,7 @@ class DownloadBackend:
                     "filename": filename,
                 })
 
-            self.logger(f"   → {len(images)} фото в альбоме Bunkr")
+            self.logger(f"   → {len(images)} файлов в альбоме Bunkr")
         except Exception as e:
             self._log_exception(e, "_collect_bunkr_album", f"url={album_url}")
             self.logger(f"❌ Ошибка загрузки альбома Bunkr: {e}")
@@ -782,7 +782,7 @@ class DownloadBackend:
                     return
                 try:
                     req_headers = {}
-                    if "scdn.st" in img_url:
+                    if "scdn.st" in img_url or "get.bunkrr." in img_url:
                         req_headers["Referer"] = "https://bunkr.cr/"
                     r = self.session.get(img_url, headers=req_headers, timeout=60, stream=True)
                     if r.status_code == 429:
