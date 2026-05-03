@@ -66,6 +66,7 @@ ICO_CLEAR    = "\uE74D"
 ICO_CHECK    = "\uE73E"
 ICO_CLOSE    = "\uE711"
 ICO_TRASH    = "\uE74D"
+ICO_PASTE    = "\uF0E3"
 
 _ICONS: dict[str, ctk.CTkImage | None] = {}
 
@@ -143,6 +144,13 @@ I18N: dict[str, dict[str, str]] = {
         "size_large":          "L",
         "clear_gallery":       "Clear Gallery",
         "gallery_title":       "Gallery  \u00b7  check images to download",
+        "ctx_cut":             "Cut",
+        "ctx_copy":            "Copy",
+        "ctx_paste":           "Paste",
+        "ctx_select_all":      "Select All",
+        "ctx_clear":           "Clear",
+        "pasted_multi":        "Added {count} URLs to queue",
+        "paste_btn":           "Paste URL",
     },
     "ru": {
         "window_title":        "JPG6 Downloader Pro",
@@ -186,6 +194,13 @@ I18N: dict[str, dict[str, str]] = {
         "size_large":          "\u041a",
         "clear_gallery":       "\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c",
         "gallery_title":       "\u0413\u0430\u043b\u0435\u0440\u0435\u044f  \u00b7  \u043e\u0442\u043c\u0435\u0442\u044c\u0442\u0435 \u0444\u043e\u0442\u043e \u0434\u043b\u044f \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438",
+        "ctx_cut":             "\u0412\u044b\u0440\u0435\u0437\u0430\u0442\u044c",
+        "ctx_copy":            "\u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c",
+        "ctx_paste":           "\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c",
+        "ctx_select_all":      "\u0412\u044b\u0434\u0435\u043b\u0438\u0442\u044c \u0432\u0441\u0451",
+        "ctx_clear":           "\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c",
+        "pasted_multi":        "\u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e {count} URL \u0432 \u043e\u0447\u0435\u0440\u0435\u0434\u044c",
+        "paste_btn":           "\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c URL",
     },
 }
 
@@ -708,6 +723,16 @@ class DownloaderCtkWindow(ctk.CTk):
         )
         self._url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._url_entry.bind("<Return>", lambda _: self.add_url())
+        self._setup_url_entry_bindings()
+
+        self._btn_paste = ctk.CTkButton(
+            inner, text="", width=44, height=40, corner_radius=R,
+            fg_color=C_SURF, hover_color=C_BORDER,
+            text_color="#ffffff", font=FONT_BTN,
+            image=get_icon(ICO_PASTE, 14), compound="left",
+            command=self._url_smart_paste,
+        )
+        self._btn_paste.grid(row=0, column=1, padx=(0, 4))
 
         self._btn_add = ctk.CTkButton(
             inner, text="", width=116, height=40, corner_radius=R,
@@ -716,11 +741,11 @@ class DownloaderCtkWindow(ctk.CTk):
             image=get_icon(ICO_ADD, 14), compound="left",
             command=self.add_url,
         )
-        self._btn_add.grid(row=0, column=1, padx=(0, 4))
+        self._btn_add.grid(row=0, column=2, padx=(0, 4))
 
         # separator
         ctk.CTkFrame(inner, width=1, height=36, fg_color=C_BORDER).grid(
-            row=0, column=2, padx=(0, 4),
+            row=0, column=3, padx=(0, 4),
         )
 
         self._btn_import = ctk.CTkButton(
@@ -730,7 +755,7 @@ class DownloaderCtkWindow(ctk.CTk):
             image=get_icon(ICO_IMPORT, 14), compound="left",
             command=self.import_urls,
         )
-        self._btn_import.grid(row=0, column=3, padx=(0, 4))
+        self._btn_import.grid(row=0, column=4, padx=(0, 4))
 
         self._btn_scan = ctk.CTkButton(
             inner, text="", width=148, height=40, corner_radius=R,
@@ -739,7 +764,7 @@ class DownloaderCtkWindow(ctk.CTk):
             image=get_icon(ICO_SCAN, 14), compound="left",
             command=self.start_scan,
         )
-        self._btn_scan.grid(row=0, column=4, padx=(0, 4))
+        self._btn_scan.grid(row=0, column=5, padx=(0, 4))
 
         self._btn_clear_q = ctk.CTkButton(
             inner, text="", width=116, height=40, corner_radius=R,
@@ -748,7 +773,7 @@ class DownloaderCtkWindow(ctk.CTk):
             image=get_icon(ICO_CLEAR, 14), compound="left",
             command=self.clear_queue,
         )
-        self._btn_clear_q.grid(row=0, column=5)
+        self._btn_clear_q.grid(row=0, column=6)
 
         # ── row 1: gallery toolbar ────────────────────────────────────────────
         gth = ctk.CTkFrame(c, fg_color="transparent")
@@ -974,6 +999,106 @@ class DownloaderCtkWindow(ctk.CTk):
             self._set_status(self._t("status_ready"))
 
     # ── Queue management ──────────────────────────────────────────────────────
+
+    def _setup_url_entry_bindings(self):
+        """Bind Ctrl+V smart paste, Ctrl+A, right-click context menu."""
+        # Inner tk.Entry for low-level bindings
+        inner = self._url_entry._entry
+        inner.bind("<Control-a>", lambda e: (inner.selection_range(0, "end"), "break")[1])
+        inner.bind("<Control-A>", lambda e: (inner.selection_range(0, "end"), "break")[1])
+        # Smart paste on Ctrl+V / Ctrl+Shift+V
+        for seq in ("<Control-v>", "<Control-V>"):
+            self._url_entry.bind(seq, self._url_smart_paste)
+            inner.bind(seq, self._url_smart_paste)
+        # Right-click context menu
+        for seq in ("<Button-3>",):
+            self._url_entry.bind(seq, self._show_url_context_menu)
+            inner.bind(seq, self._show_url_context_menu)
+
+    def _url_smart_paste(self, event=None):
+        """Smart paste from clipboard.
+        - Multiple http lines → add all to queue directly.
+        - Single http URL → put in entry field.
+        - Anything else → standard text insert.
+        """
+        try:
+            clip = self.clipboard_get()
+        except Exception:
+            return "break"
+
+        lines = [ln.strip() for ln in clip.splitlines() if ln.strip().startswith("http")]
+
+        if len(lines) > 1:
+            added = 0
+            for line in lines:
+                if line not in self._queued_urls:
+                    self._queued_urls.append(line)
+                    added += 1
+            self._url_var.set("")
+            self._set_status(self._t("pasted_multi", count=added))
+        elif len(lines) == 1:
+            self._url_var.set(lines[0])
+            try:
+                self._url_entry._entry.icursor("end")
+            except Exception:
+                pass
+        else:
+            # Not a URL — do plain insert at cursor
+            try:
+                inner = self._url_entry._entry
+                if inner.selection_present():
+                    inner.delete("sel.first", "sel.last")
+                inner.insert("insert", clip)
+            except Exception:
+                pass
+        return "break"
+
+    def _show_url_context_menu(self, event):
+        """Right-click context menu for the URL entry."""
+        inner = self._url_entry._entry
+        try:
+            has_sel = bool(inner.selection_present())
+        except Exception:
+            has_sel = False
+        try:
+            clip_text = self.clipboard_get()
+            clip_has_content = bool(clip_text.strip())
+        except Exception:
+            clip_text = ""
+            clip_has_content = False
+
+        menu = tk.Menu(
+            self, tearoff=0,
+            bg=C_CARD, fg=C_TEXT,
+            activebackground=C_ACC1, activeforeground="#ffffff",
+            bd=0, relief="flat", font=FONT_SM,
+        )
+        menu.add_command(
+            label=self._t("ctx_cut"),
+            command=lambda: inner.event_generate("<<Cut>>"),
+            state="normal" if has_sel else "disabled",
+        )
+        menu.add_command(
+            label=self._t("ctx_copy"),
+            command=lambda: inner.event_generate("<<Copy>>"),
+            state="normal" if has_sel else "disabled",
+        )
+        menu.add_command(
+            label=self._t("ctx_paste"),
+            command=self._url_smart_paste,
+            state="normal" if clip_has_content else "disabled",
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=self._t("ctx_select_all"),
+            command=lambda: inner.selection_range(0, "end"),
+        )
+        menu.add_command(
+            label=self._t("ctx_clear"),
+            command=lambda: self._url_var.set(""),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
     def add_url(self):
         url = self._url_var.get().strip()
         if not url:
