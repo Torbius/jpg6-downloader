@@ -23,6 +23,25 @@ JPG_MIRRORS = [
 ]
 _MIRROR_RE = re.compile(r"^https?://(?:www\.)?(" + "|".join(JPG_MIRRORS) + r")", re.IGNORECASE)
 
+# Bunkr hosting — matches bunkr.<any tld>
+_BUNKR_HOST_RE = re.compile(r"^bunkr\.[a-z]{2,10}$", re.IGNORECASE)
+
+
+def is_bunkr_url(url):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+        return bool(_BUNKR_HOST_RE.match(host))
+    except Exception:
+        return False
+
+
+def is_bunkr_album(url):
+    return is_bunkr_url(url) and urlparse(url).path.strip("/").startswith("a/")
+
+
+def is_bunkr_file_page(url):
+    return is_bunkr_url(url) and urlparse(url).path.strip("/").startswith("f/")
+
 DEFAULT_WORKERS = 3
 DOWNLOAD_DELAY = 0.05
 MAX_RETRIES = 3
@@ -88,6 +107,8 @@ def classify_url(url):
     lower_path = p.path.lower()
     if re.search(r"\.(jpg|jpeg|png|webp|gif|bmp|avif|jfif)$", lower_path):
         return "direct_image"
+    if is_bunkr_album(url):
+        return "bunkr_album"
     if not is_jpg_mirror(url):
         return "unknown"
     path = p.path.strip("/")
@@ -311,6 +332,85 @@ class DownloadBackend:
 
         self.logger(f"📊 Найдено {len(album_urls)} альбомов")
         return album_urls
+
+    # ------------------------------------------------------------------
+    # Bunkr support
+    # ------------------------------------------------------------------
+
+    def _resolve_bunkr_file_cdn_url(self, file_page_url):
+        """Fetch a bunkr /f/<id> page and return the direct CDN image URL."""
+        try:
+            resp = _request_with_retry(self.session, file_page_url, timeout=15)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # "Enlarge image" link → direct CDN (c1fr.scdn.st, c2fr.scdn.st, …)
+            enlarge = soup.find("a", href=re.compile(r"https?://[a-z0-9]+\.scdn\.st/", re.I))
+            if enlarge and enlarge.get("href") and "static.scdn.st" not in enlarge["href"]:
+                return enlarge["href"]
+            # Fallback: download button on get.bunkrr.su
+            dl = soup.find("a", href=re.compile(r"https?://get\.bunkrr\.", re.I))
+            if dl and dl.get("href"):
+                return dl["href"]
+        except Exception as e:
+            self._log_exception(e, "_resolve_bunkr_file_cdn_url", f"url={file_page_url}")
+        return None
+
+    def _collect_bunkr_album(self, album_url):
+        """Parse a bunkr album page; returns (album_title, images).
+        Each image dict has url=file_page_url (resolved to CDN on download),
+        thumb_url=static CDN thumbnail, filename from the page.
+        Only image files are included (videos are skipped).
+        """
+        images = []
+        p = urlparse(album_url)
+        base_url = f"{p.scheme}://{p.netloc}"
+        try:
+            resp = _request_with_retry(self.session, album_url, timeout=15)
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            title_el = soup.select_one("h1")
+            album_title = title_el.get_text(strip=True) if title_el else "bunkr_album"
+
+            for card in soup.select("div.theItem"):
+                # Only download image files — skip video/pdf etc.
+                type_span = card.select_one("span[class*='type-']")
+                if type_span:
+                    span_classes = " ".join(type_span.get("class", []))
+                    if "type-Image" not in span_classes:
+                        continue
+
+                # Filename (visible label)
+                name_el = card.select_one("p.theName")
+                filename = name_el.get_text(strip=True) if name_el else ""
+                if not filename:
+                    hidden = card.find("p", style=re.compile(r"display\s*:\s*none", re.I))
+                    filename = hidden.get_text(strip=True) if hidden else "image.jpg"
+                filename = sanitize_filename(filename)
+
+                # Thumbnail URL
+                thumb_img = card.select_one("img.grid-images_box-img")
+                thumb_url = thumb_img.get("src", "") if thumb_img else ""
+
+                # File page link (/f/<id>)
+                file_link = card.find("a", href=re.compile(r"^/f/"))
+                if not file_link:
+                    file_link = card.find("a", attrs={"aria-label": "download"})
+                if not file_link or not file_link.get("href"):
+                    continue
+
+                file_page_url = urljoin(base_url, file_link["href"])
+                images.append({
+                    "url": file_page_url,   # resolved to CDN during download
+                    "thumb_url": thumb_url,
+                    "filename": filename,
+                })
+
+            self.logger(f"   → {len(images)} фото в альбоме Bunkr")
+        except Exception as e:
+            self._log_exception(e, "_collect_bunkr_album", f"url={album_url}")
+            self.logger(f"❌ Ошибка загрузки альбома Bunkr: {e}")
+            return "bunkr_album", []
+
+        return album_title, images
 
     def _collect_album_images(self, album_url):
         images = []
@@ -611,6 +711,20 @@ class DownloadBackend:
                 return
 
             img_url = thumb_to_original(img["url"])
+
+            # Resolve bunkr /f/<id> page → direct CDN image URL
+            if is_bunkr_file_page(img_url):
+                resolved = self._resolve_bunkr_file_cdn_url(img_url)
+                if resolved:
+                    img_url = resolved
+                else:
+                    self.logger(f"❌ [{idx}/{total}] Не удалось получить CDN URL: {img_url}")
+                    with self._lock:
+                        errors += 1
+                        completed += 1
+                        self.progress_cb(global_offset + completed, effective_total)
+                    return
+
             fallback_name = os.path.basename(urlparse(img_url).path) or f"image_{idx}.jpg"
             filename = sanitize_filename(img.get("filename") or fallback_name, fallback=f"image_{idx}.jpg")
 
@@ -627,7 +741,10 @@ class DownloadBackend:
                 if self.is_cancelled():
                     return
                 try:
-                    r = self.session.get(img_url, timeout=60, stream=True)
+                    req_headers = {}
+                    if "scdn.st" in img_url:
+                        req_headers["Referer"] = "https://bunkr.cr/"
+                    r = self.session.get(img_url, headers=req_headers, timeout=60, stream=True)
                     if r.status_code == 429:
                         delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                         time.sleep(delay)
@@ -671,7 +788,10 @@ class DownloadBackend:
                     self.progress_cb(global_offset + completed, effective_total)
                 self.logger(f"❌ [{idx}/{total}] {last_err}")
 
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+        # Use 1 worker for bunkr (each file needs a pre-fetch of the /f/ page)
+        bunkr_mode = bool(images and is_bunkr_file_page(images[0].get("url", "")))
+        effective_workers = 1 if bunkr_mode else self.workers
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
             futures = [pool.submit(_download_one, (i, img)) for i, img in enumerate(images, 1)]
             for future in as_completed(futures):
                 if self.is_cancelled():
@@ -686,6 +806,10 @@ class DownloadBackend:
 
     def _resolve_images_for_url(self, url):
         url_type = classify_url(url)
+
+        if url_type == "bunkr_album":
+            title, images = self._collect_bunkr_album(url)
+            return title, images
 
         if url_type == "direct_image":
             folder = self._batch_name or "direct_images"
