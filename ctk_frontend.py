@@ -1162,6 +1162,9 @@ class DownloaderCtkWindow(ctk.CTk):
         if self._worker and self._worker.is_alive():
             self._set_status(self._t("backend_running"))
             return
+        # Auto-add whatever is typed/pasted in the entry field
+        if self._url_var.get().strip():
+            self.add_url()
         if not self._queued_urls:
             self._set_status(self._t("queue_empty"))
             return
