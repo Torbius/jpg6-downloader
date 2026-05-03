@@ -375,18 +375,25 @@ class DownloadBackend:
     # ------------------------------------------------------------------
 
     def _resolve_bunkr_file_cdn_url(self, file_page_url):
-        """Fetch a bunkr /f/<id> page and return the direct CDN image URL."""
+        """Fetch a bunkr /f/<id> page and return the direct CDN URL.
+        Returns None on hard failure, or the sentinel '::unavailable::' when
+        the server is under maintenance (Download unavailable button).
+        """
         try:
             resp = _request_with_retry(self.session, file_page_url, timeout=15)
             soup = BeautifulSoup(resp.text, "html.parser")
-            # "Enlarge image" link → direct CDN (c1fr.scdn.st, c2fr.scdn.st, …)
+            # "Enlarge image" link → direct CDN (c1fr.scdn.st, c2fr.scdn.st, …) for images
             enlarge = soup.find("a", href=re.compile(r"https?://[a-z0-9]+\.scdn\.st/", re.I))
             if enlarge and enlarge.get("href") and "static.scdn.st" not in enlarge["href"]:
                 return enlarge["href"]
-            # Fallback: download button on get.bunkrr.su
+            # Download button for videos/archives → get.bunkrr.su/file/<id>
             dl = soup.find("a", href=re.compile(r"https?://get\.bunkrr\.", re.I))
             if dl and dl.get("href"):
                 return dl["href"]
+            # Detect "Download unavailable" (server maintenance) — disabled button
+            disabled_btn = soup.find("button", attrs={"disabled": True})
+            if disabled_btn and "unavailable" in disabled_btn.get_text(strip=True).lower():
+                return "::unavailable::"
         except Exception as e:
             self._log_exception(e, "_resolve_bunkr_file_cdn_url", f"url={file_page_url}")
         return None
@@ -395,7 +402,7 @@ class DownloadBackend:
         """Parse a bunkr album page; returns (album_title, images).
         Each image dict has url=file_page_url (resolved to CDN on download),
         thumb_url=static CDN thumbnail, filename from the page.
-        Only image files are included (videos are skipped).
+        Collects images (type-Image), archives (type-File) and videos (type-Video).
         """
         images = []
         p = urlparse(album_url)
@@ -408,12 +415,7 @@ class DownloadBackend:
             album_title = title_el.get_text(strip=True) if title_el else "bunkr_album"
 
             for card in soup.select("div.theItem"):
-                # Skip video files; allow images (type-Image) and archives/files (type-File)
-                type_span = card.select_one("span[class*='type-']")
-                if type_span:
-                    span_classes = " ".join(type_span.get("class", []))
-                    if "type-Video" in span_classes:
-                        continue
+                # Collect all file types (images, videos, archives)
 
                 # Filename (visible label)
                 name_el = card.select_one("p.theName")
@@ -762,7 +764,14 @@ class DownloadBackend:
             # Resolve bunkr /f/<id> page → direct CDN image URL
             if is_bunkr_file_page(img_url):
                 resolved = self._resolve_bunkr_file_cdn_url(img_url)
-                if resolved:
+                if resolved == "::unavailable::":
+                    self.logger(f"⏸ [{idx}/{total}] {img.get('filename', '?')}  (сервер на обслуживании)")
+                    with self._lock:
+                        skipped += 1
+                        completed += 1
+                        self.progress_cb(global_offset + completed, effective_total)
+                    return
+                elif resolved:
                     img_url = resolved
                 else:
                     self.logger(f"❌ [{idx}/{total}] Не удалось получить CDN URL: {img_url}")
