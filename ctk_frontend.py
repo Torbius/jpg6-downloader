@@ -8,11 +8,12 @@ import threading
 import urllib.request
 from io import BytesIO
 from tkinter import filedialog
+import tkinter as tk
 
 import customtkinter as ctk
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
 except ImportError:
     print("Pillow is required: pip install Pillow")
     sys.exit(1)
@@ -336,22 +337,25 @@ class ThumbnailCard(ctk.CTkFrame):
         self.thumb_url   = thumb_url
         self.thumb_size  = thumb_size
         self._pil_image: Image.Image | None = None
-        self._ctk_image: ctk.CTkImage | None = None
+        self._tk_image: ImageTk.PhotoImage | None = None
         self._checked    = True
         self._build()
 
     def _build(self):
         s = self.thumb_size
         self.configure(width=s + 16)
-        # Do NOT use pack_propagate(False) — let height flex with image size
 
-        placeholder = Image.new("RGB", (s, s), self._PLACEHOLDER_COLOR)
-        self._ctk_image = ctk.CTkImage(
-            light_image=placeholder, dark_image=placeholder, size=(s, s)
-        )
-        self._img_label = ctk.CTkLabel(
-            self, image=self._ctk_image, text="",
-            fg_color="transparent", cursor="hand2",
+        # Use plain tk.Label + ImageTk.PhotoImage instead of CTkLabel/CTkImage:
+        # CTkImage re-applies DPI scaling on every paint (causing smear/stripes
+        # while scrolling). ImageTk.PhotoImage is a static, pre-scaled bitmap.
+        scale = self._get_widget_scaling() if hasattr(self, "_get_widget_scaling") else 1.0
+        self._phys_size = max(1, int(round(s * scale)))
+        placeholder = Image.new("RGB", (self._phys_size, self._phys_size), self._PLACEHOLDER_COLOR)
+        self._tk_image = ImageTk.PhotoImage(placeholder)
+        # plain tk.Label (no CTk overhead per redraw)
+        self._img_label = tk.Label(
+            self, image=self._tk_image, text="", bd=0, highlightthickness=0,
+            bg=C_CARD, cursor="hand2",
         )
         self._img_label.pack(padx=8, pady=(8, 2))
         self._img_label.bind("<Button-1>", self._on_click)
@@ -385,16 +389,16 @@ class ThumbnailCard(ctk.CTkFrame):
 
     # ── public API ────────────────────────────────────────────────────────────
     def set_image(self, pil_img: Image.Image):
-        """Update card with real thumbnail, letterboxed to fixed size (no reflow)."""
+        """Update card with real thumbnail, letterboxed to fixed physical size."""
         self._pil_image = pil_img
-        s = self.thumb_size
+        ps = self._phys_size
         copy = pil_img.copy()
-        copy.thumbnail((s, s), Image.LANCZOS)
+        copy.thumbnail((ps, ps), Image.LANCZOS)
         w, h = copy.size
-        lb = Image.new("RGB", (s, s), self._PLACEHOLDER_COLOR)
-        lb.paste(copy, ((s - w) // 2, (s - h) // 2))
-        self._ctk_image = ctk.CTkImage(light_image=lb, dark_image=lb, size=(s, s))
-        self._img_label.configure(image=self._ctk_image)
+        lb = Image.new("RGB", (ps, ps), self._PLACEHOLDER_COLOR)
+        lb.paste(copy, ((ps - w) // 2, (ps - h) // 2))
+        self._tk_image = ImageTk.PhotoImage(lb)
+        self._img_label.configure(image=self._tk_image)
 
     def set_checked(self, value: bool):
         self._check_var.set(value)
@@ -407,15 +411,14 @@ class ThumbnailCard(ctk.CTkFrame):
     def resize_thumb(self, new_size: int):
         self.thumb_size = new_size
         self.configure(width=new_size + 16)
+        scale = self._get_widget_scaling() if hasattr(self, "_get_widget_scaling") else 1.0
+        self._phys_size = max(1, int(round(new_size * scale)))
         if self._pil_image:
             self.set_image(self._pil_image)
         else:
-            placeholder = Image.new("RGB", (new_size, new_size), self._PLACEHOLDER_COLOR)
-            self._ctk_image = ctk.CTkImage(
-                light_image=placeholder, dark_image=placeholder,
-                size=(new_size, new_size),
-            )
-            self._img_label.configure(image=self._ctk_image)
+            placeholder = Image.new("RGB", (self._phys_size, self._phys_size), self._PLACEHOLDER_COLOR)
+            self._tk_image = ImageTk.PhotoImage(placeholder)
+            self._img_label.configure(image=self._tk_image)
 
 
 # ── Gallery scrollable frame ───────────────────────────────────────────────────
@@ -434,10 +437,10 @@ class GalleryFrame(ctk.CTkScrollableFrame):
         self._cols  = 5
         self._canvas_w: int = 0
         self._relayout_pending = False
-        # increase scroll speed: each "unit" = 8px, scroll 5 units per notch
-        self._parent_canvas.configure(yscrollincrement=8)
-        # NOTE: do NOT bind _parent_canvas.<Configure> here — we override
-        # _fit_frame_dimensions_to_canvas() below so the parent binding still works.
+        # Discrete fast scroll — 1 unit = 1px, ~50px per wheel notch.
+        # Smooth animation caused image-tearing artifacts during partial canvas
+        # repaints, so we use a single full repaint per notch instead.
+        self._parent_canvas.configure(yscrollincrement=1)
         self.bind("<MouseWheel>", self._on_scroll)
 
     # ── mousewheel scroll fix ─────────────────────────────────────────────────
@@ -453,7 +456,9 @@ class GalleryFrame(ctk.CTkScrollableFrame):
             self.after(80, self._deferred_relayout)
 
     def _on_scroll(self, event):
-        self._parent_canvas.yview_scroll(int(-1 * (event.delta / 120)) * 5, "units")
+        """Discrete scroll — single full canvas repaint per wheel notch."""
+        notches = int(-1 * (event.delta / 120))
+        self._parent_canvas.yview_scroll(notches * 50, "units")
 
     def _bind_scroll_recursive(self, widget):
         """Bind mousewheel on all descendants so child widgets don't eat scroll."""
