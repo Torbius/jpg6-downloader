@@ -18,7 +18,7 @@ except ImportError:
     print("Pillow is required: pip install Pillow")
     sys.exit(1)
 
-from backend import CONFIG_DIR, DEBUG_LOG_FILE, ERROR_LOG_FILE, DownloadBackend
+from backend import CONFIG_DIR, DEBUG_LOG_FILE, ERROR_LOG_FILE, DownloadBackend, format_size
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -276,15 +276,17 @@ class DownloadWorker:
     """Thread that downloads selected images."""
 
     def __init__(self, selected, base_dir, workers,
-                 log_cb=None, status_cb=None, progress_cb=None, finished_cb=None):
-        self.selected    = selected
-        self.base_dir    = base_dir
-        self.workers     = workers
-        self.log_cb      = log_cb
-        self.status_cb   = status_cb
-        self.progress_cb = progress_cb
-        self.finished_cb = finished_cb
-        self.backend     = None
+                 log_cb=None, status_cb=None, progress_cb=None,
+                 finished_cb=None, file_progress_cb=None):
+        self.selected         = selected
+        self.base_dir         = base_dir
+        self.workers          = workers
+        self.log_cb           = log_cb
+        self.status_cb        = status_cb
+        self.progress_cb      = progress_cb
+        self.finished_cb      = finished_cb
+        self.file_progress_cb = file_progress_cb
+        self.backend          = None
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -295,6 +297,7 @@ class DownloadWorker:
         self.backend = DownloadBackend(
             base_dir=self.base_dir, workers=self.workers,
             logger=self.log_cb, status_cb=self.status_cb, progress_cb=self.progress_cb,
+            file_progress_cb=self.file_progress_cb,
         )
         summary = self.backend.download_selected(self.selected)
         if self.finished_cb:
@@ -564,6 +567,9 @@ class DownloaderCtkWindow(ctk.CTk):
         self._log_job_id             = None
         self._pending_cards: list    = []
         self._flush_job: str | None  = None
+        # Per-file progress tracking (in-place log update)
+        self._engine_progress_line: int | None = None
+        self._engine_progress_filename: str    = ""
 
         self.title("JPG6 Downloader Pro")
         self.geometry("1380x880")
@@ -1246,6 +1252,9 @@ class DownloaderCtkWindow(ctk.CTk):
             status_cb=lambda txt: self.after(0, lambda t=txt: self._set_status(t)),
             progress_cb=lambda d, t: self.after(0, lambda d=d, t=t: self._on_progress(d, t)),
             finished_cb=lambda s: self.after(0, lambda s=s: self._on_download_finished(s)),
+            file_progress_cb=lambda fn, d, t: self.after(
+                0, lambda fn=fn, d=d, t=t: self._on_file_progress(fn, d, t)
+            ),
         )
         self._worker.start()
 
@@ -1269,10 +1278,68 @@ class DownloaderCtkWindow(ctk.CTk):
         self._lbl_status.configure(text=text)
 
     def _append_engine_log(self, msg: str):
-        self._log_engine.configure(state="normal")
-        self._log_engine.insert("end", msg + "\n")
-        self._log_engine.see("end")
-        self._log_engine.configure(state="disabled")
+        """Append a line to Engine log.
+        If a progress line is active, replace it with this (final) line."""
+        tw = self._log_engine._textbox
+        tw.configure(state="normal")
+        if self._engine_progress_line is not None:
+            # Replace the in-progress line with the completed line
+            line = self._engine_progress_line
+            tw.delete(f"{line}.0", f"{line}.end")
+            tw.insert(f"{line}.0", msg)
+            self._engine_progress_line = None
+            self._engine_progress_filename = ""
+        else:
+            tw.insert("end", msg + "\n")
+        tw.see("end")
+        tw.configure(state="disabled")
+
+    def _engine_start_progress_line(self, msg: str):
+        """Insert a new progress line and remember its line number for in-place updates."""
+        tw = self._log_engine._textbox
+        tw.configure(state="normal")
+        tw.insert("end", msg + "\n")
+        # Line number = total lines - 2 (last line is empty due to trailing \n)
+        line_num = int(tw.index("end").split(".")[0]) - 2
+        self._engine_progress_line = max(1, line_num)
+        tw.see("end")
+        tw.configure(state="disabled")
+
+    def _engine_update_progress_line(self, msg: str):
+        """Update the active progress line in-place."""
+        if self._engine_progress_line is None:
+            return
+        tw = self._log_engine._textbox
+        tw.configure(state="normal")
+        line = self._engine_progress_line
+        tw.delete(f"{line}.0", f"{line}.end")
+        tw.insert(f"{line}.0", msg)
+        tw.see("end")
+        tw.configure(state="disabled")
+
+    def _on_file_progress(self, filename: str, done: int, total: int):
+        """Handle per-file download progress — called on main thread via after()."""
+        if total <= 0:
+            return
+        pct = int(done / total * 100)
+        bar_w = 14
+        filled = int(done / total * bar_w)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        size_done = format_size(done)
+        size_total = format_size(total)
+        name_part = filename[:36].ljust(36) if len(filename) > 36 else filename.ljust(36)
+        if which == "engine":
+            self._engine_progress_line = None
+            self._engine_progress_filename = ""
+        msg = f"⬇  {name_part}  {size_done:>9} / {size_total:<9}  [{bar}]  {pct:3d}%"
+
+        if done == 0:
+            # New file starting — reset tracking if different file
+            self._engine_progress_line = None
+            self._engine_progress_filename = filename
+            self._engine_start_progress_line(msg)
+        elif self._engine_progress_filename == filename and self._engine_progress_line is not None:
+            self._engine_update_progress_line(msg)
 
     def _on_progress(self, done: int, total: int):
         if total <= 0:

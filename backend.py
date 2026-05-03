@@ -70,6 +70,17 @@ def original_to_thumb(url):
     return url
 
 
+def format_size(n: int) -> str:
+    """Human-readable file size."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1_048_576:
+        return f"{n / 1024:.1f} KB"
+    if n < 1_073_741_824:
+        return f"{n / 1_048_576:.1f} MB"
+    return f"{n / 1_073_741_824:.2f} GB"
+
+
 def sanitize_filename(name, fallback="image.jpg"):
     if not name:
         name = fallback
@@ -215,6 +226,7 @@ class DownloadBackend:
         item_status_cb=None,
         progress_cb=None,
         image_downloaded_cb=None,
+        file_progress_cb=None,
     ):
         self.base_dir = os.path.normpath(base_dir or os.path.join(SCRIPT_DIR, "downloads"))
         self.workers = int(max(1, workers))
@@ -223,6 +235,8 @@ class DownloadBackend:
         self.item_status_cb = item_status_cb or (lambda url, status: None)
         self.progress_cb = progress_cb or (lambda done, total: None)
         self.image_downloaded_cb = image_downloaded_cb or (lambda path: None)
+        # file_progress_cb(filename, bytes_done, bytes_total)
+        self.file_progress_cb = file_progress_cb or (lambda fn, done, total: None)
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._batch_name = None
@@ -695,7 +709,7 @@ class DownloadBackend:
         total = len(images)
         effective_total = global_total if global_total is not None else total
         if total == 0:
-            return {"downloaded": 0, "skipped": 0, "errors": 0}
+            return {"downloaded": 0, "skipped": 0, "errors": 0, "total_bytes": 0}
 
         self.logger(f"🔗 {total} фото. Скачиваю...")
 
@@ -703,9 +717,10 @@ class DownloadBackend:
         skipped = 0
         errors = 0
         completed = 0
+        total_bytes = 0
 
         def _download_one(idx_img):
-            nonlocal downloaded, skipped, errors, completed
+            nonlocal downloaded, skipped, errors, completed, total_bytes
             idx, img = idx_img
             if self.is_cancelled():
                 return
@@ -733,6 +748,7 @@ class DownloadBackend:
                     skipped += 1
                     completed += 1
                     self.progress_cb(global_offset + completed, effective_total)
+                    self.logger(f"⏭ [{idx}/{total}] {filename}  (уже скачан)")
                     return
 
             time.sleep(DOWNLOAD_DELAY)
@@ -751,12 +767,23 @@ class DownloadBackend:
                         continue
                     r.raise_for_status()
 
+                    content_length = int(r.headers.get("Content-Length", 0) or 0)
+                    self.file_progress_cb(filename, 0, content_length)
+
                     filepath = os.path.join(save_dir, filename)
+                    bytes_written = 0
+                    last_cb_time = 0.0
                     with open(filepath, "wb") as f:
                         for chunk in r.iter_content(65536):
                             if self.is_cancelled():
                                 break
                             f.write(chunk)
+                            bytes_written += len(chunk)
+                            if content_length > 0:
+                                now = time.monotonic()
+                                if now - last_cb_time >= 0.12:
+                                    self.file_progress_cb(filename, bytes_written, content_length)
+                                    last_cb_time = now
 
                     if self.is_cancelled():
                         try:
@@ -765,12 +792,14 @@ class DownloadBackend:
                             pass
                         return
 
+                    size_str = format_size(bytes_written)
                     with self._lock:
                         downloaded += 1
                         completed += 1
+                        total_bytes += bytes_written
                         existing.add(filename)
                         self.progress_cb(global_offset + completed, effective_total)
-                    self.logger(f"✅ [{idx}/{total}] {filename}")
+                    self.logger(f"✅ [{idx}/{total}] {filename}  •  {size_str}")
                     self.image_downloaded_cb(filepath)
                     last_err = None
                     break
@@ -802,7 +831,7 @@ class DownloadBackend:
                 except Exception as e:
                     self._log_exception(e, "_download_images:future")
 
-        return {"downloaded": downloaded, "skipped": skipped, "errors": errors}
+        return {"downloaded": downloaded, "skipped": skipped, "errors": errors, "total_bytes": total_bytes}
 
     def _resolve_images_for_url(self, url):
         url_type = classify_url(url)
@@ -920,6 +949,7 @@ class DownloadBackend:
         total_downloaded = 0
         total_skipped = 0
         total_errors = 0
+        total_bytes_all = 0
 
         for album_title in order:
             images = grouped[album_title]
@@ -937,17 +967,21 @@ class DownloadBackend:
             total_downloaded += stats["downloaded"]
             total_skipped += stats["skipped"]
             total_errors += stats["errors"]
+            total_bytes_all += stats.get("total_bytes", 0)
 
         summary = {
             "albums": len(order),
             "downloaded": total_downloaded,
             "skipped": total_skipped,
             "errors": total_errors,
+            "total_bytes": total_bytes_all,
             "cancelled": self.is_cancelled(),
         }
         self.status_cb("Finished" if not self.is_cancelled() else "Cancelled")
+        size_str = format_size(total_bytes_all) if total_bytes_all > 0 else ""
+        size_part = f"  ({size_str})" if size_str else ""
         self.logger(
-            f"🎉 Готово! Альбомов: {summary['albums']}, скачано: {summary['downloaded']}, "
+            f"🎉 Готово! Альбомов: {summary['albums']}, скачано: {summary['downloaded']}{size_part}, "
             f"пропущено: {summary['skipped']}, ошибок: {summary['errors']}"
         )
         return summary
