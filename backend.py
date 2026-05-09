@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import random
 import re
+import string
 import threading
 import time
 import traceback
@@ -45,8 +47,11 @@ def is_bunkr_file_page(url):
 
 DEFAULT_WORKERS = 3
 DOWNLOAD_DELAY = 0.05
+BUNKR_DOWNLOAD_DELAY = 2.0  # пауза между файлами bunkr (1 поток, защита от бана)
 MAX_RETRIES = 3
 RETRY_DELAYS = [1.0, 3.0, 7.0]
+SCAN_RETRY_DELAYS = [1.5, 3.0]  # короткие задержки для повторов при сканировании
+SCAN_MAX_RETRIES = 2  # максимум 2 повтора при сканировании (суммарно до ~4.5с)
 
 
 def is_jpg_mirror(url):
@@ -91,17 +96,29 @@ def file_md5(path: str) -> str:
     return h.hexdigest()
 
 
+_RAND_CHARS = string.ascii_lowercase + string.digits  # 36 chars
+
+
 def _unique_filename(base_name: str, existing: set) -> str:
-    """Return base_name, or base_name (N).ext if base_name is already taken."""
+    """Return base_name, or base_name + 1 random char if name is already taken."""
     if base_name not in existing:
         return base_name
     stem, ext = os.path.splitext(base_name)
-    i = 1
-    while True:
-        candidate = f"{stem} ({i}){ext}"
+    # Try all 36 single-char suffixes in random order first
+    chars = list(_RAND_CHARS)
+    random.shuffle(chars)
+    for ch in chars:
+        candidate = f"{stem}{ch}{ext}"
         if candidate not in existing:
             return candidate
-        i += 1
+    # Fallback: 2-char suffix (unlikely to be needed)
+    for _ in range(200):
+        suffix = random.choice(_RAND_CHARS) + random.choice(_RAND_CHARS)
+        candidate = f"{stem}{suffix}{ext}"
+        if candidate not in existing:
+            return candidate
+    # Last resort
+    return f"{stem}_{int(time.time())}{ext}"
 
 
 def sanitize_filename(name, fallback="image.jpg"):
@@ -220,13 +237,16 @@ def is_oembed_first_candidate(page_url):
         return False
 
 
-def _request_with_retry(session, url, max_retries=MAX_RETRIES, **kwargs):
+def _request_with_retry(session, url, max_retries=MAX_RETRIES, retry_delays=None, **kwargs):
+    if retry_delays is None:
+        retry_delays = RETRY_DELAYS
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             resp = session.get(url, **kwargs)
-            if resp.status_code == 429:
-                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+            if resp.status_code in (429, 503):
+                # Rate-limited or temporarily unavailable — delay and retry
+                delay = retry_delays[min(attempt, len(retry_delays) - 1)]
                 time.sleep(delay)
                 continue
             resp.raise_for_status()
@@ -234,7 +254,7 @@ def _request_with_retry(session, url, max_retries=MAX_RETRIES, **kwargs):
         except requests.RequestException as e:
             last_exc = e
             if attempt < max_retries:
-                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                delay = retry_delays[min(attempt, len(retry_delays) - 1)]
                 time.sleep(delay)
     raise last_exc
 
@@ -263,8 +283,16 @@ class DownloadBackend:
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._batch_name = None
+        self._in_scan = False  # True while scan_for_preview runs → fail-fast HTTP
 
         self.session = requests.Session()
+        # Enlarge connection pool so high thread counts don't block waiting for a slot
+        _pool_size = max(self.workers, 32)
+        _adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_pool_size, pool_maxsize=_pool_size
+        )
+        self.session.mount("https://", _adapter)
+        self.session.mount("http://", _adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -375,25 +403,89 @@ class DownloadBackend:
     # ------------------------------------------------------------------
 
     def _resolve_bunkr_file_cdn_url(self, file_page_url):
-        """Fetch a bunkr /f/<id> page and return the direct CDN URL.
-        Returns None on hard failure, or the sentinel '::unavailable::' when
-        the server is under maintenance (Download unavailable button).
+        """Fetch a bunkr /f/<slug> page and return the direct CDN download URL.
+
+        Flow (updated 2025):
+        1. Parse /f/ page → get numeric file_id from data-file-id attribute and
+           the get.bunkrr.su download page URL.
+        2. Load get.bunkrr.su/file/<id> to acquire DDoS-Guard cookies.
+        3. POST https://apidl.bunkr.ru/api/_001_v2 with {"id": file_id}.
+        4. Decrypt the returned encrypted URL:
+           key = "SECRET_KEY_" + str(floor(response_timestamp / 3600))
+           via XOR cipher (TextEncoder key bytes, repeating).
+        5. Return the decrypted CDN URL (direct download, no redirect).
+
+        Returns None on hard failure, or '::unavailable::' when file is gone.
         """
+        import base64
+        import math
         try:
+            # Step 1: parse the /f/ page
             resp = _request_with_retry(self.session, file_page_url, timeout=15)
             soup = BeautifulSoup(resp.text, "html.parser")
-            # "Enlarge image" link → direct CDN (c1fr.scdn.st, c2fr.scdn.st, …) for images
-            enlarge = soup.find("a", href=re.compile(r"https?://[a-z0-9]+\.scdn\.st/", re.I))
-            if enlarge and enlarge.get("href") and "static.scdn.st" not in enlarge["href"]:
-                return enlarge["href"]
-            # Download button for videos/archives → get.bunkrr.su/file/<id>
-            dl = soup.find("a", href=re.compile(r"https?://get\.bunkrr\.", re.I))
-            if dl and dl.get("href"):
-                return dl["href"]
+
             # Detect "Download unavailable" (server maintenance) — disabled button
             disabled_btn = soup.find("button", attrs={"disabled": True})
             if disabled_btn and "unavailable" in disabled_btn.get_text(strip=True).lower():
                 return "::unavailable::"
+
+            # Extract numeric file ID from <script data-file-id="...">
+            script_tag = soup.find("script", attrs={"data-file-id": True})
+            file_id = script_tag["data-file-id"] if script_tag else None
+
+            # Fallback: parse from the get.bunkrr.su href
+            if not file_id:
+                dl_link = soup.find("a", href=re.compile(r"https?://get\.bunkrr\.", re.I))
+                if dl_link and dl_link.get("href"):
+                    file_id = dl_link["href"].rstrip("/").split("/")[-1]
+
+            if not file_id:
+                self.logger("⚠️ Bunkr: не удалось извлечь file_id со страницы")
+                return None
+
+            # Step 2: load get.bunkrr.su page to acquire anti-bot cookies
+            bunkrr_page_url = f"https://get.bunkrr.su/file/{file_id}"
+            _request_with_retry(self.session, bunkrr_page_url, timeout=15)
+
+            # Step 3: call the decryption API
+            api_url = "https://apidl.bunkr.ru/api/_001_v2"
+            api_headers = {
+                "Referer": "https://get.bunkrr.su/",
+                "Origin": "https://get.bunkrr.su",
+                "Content-Type": "application/json",
+                "Accept": "application/json, */*",
+            }
+            api_resp = self.session.post(
+                api_url, json={"id": file_id},
+                headers=api_headers, timeout=15
+            )
+            api_resp.raise_for_status()
+            data = api_resp.json()
+
+            encrypted_b64 = data.get("url", "")
+            timestamp = data.get("timestamp", 0)
+            is_encrypted = data.get("encrypted", False)
+
+            if not is_encrypted:
+                # API returned plain URL directly
+                return encrypted_b64 or None
+
+            # Step 4: decrypt XOR cipher
+            # key = "SECRET_KEY_" + str(floor(timestamp / 3600))
+            key_str = f"SECRET_KEY_{int(math.floor(timestamp / 3600))}"
+            enc_bytes = base64.b64decode(encrypted_b64)
+            key_bytes = key_str.encode("utf-8")
+            dec_bytes = bytes(
+                b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(enc_bytes)
+            )
+            cdn_url = dec_bytes.decode("utf-8", errors="replace").rstrip("\x00")
+
+            # Strip tracker param added by browser JS (?n=filename) if any
+            if "?" in cdn_url:
+                cdn_url = cdn_url.split("?")[0]
+
+            return cdn_url or None
+
         except Exception as e:
             self._log_exception(e, "_resolve_bunkr_file_cdn_url", f"url={file_page_url}")
         return None
@@ -597,7 +689,9 @@ class DownloadBackend:
             oembed_base = f"{parsed_target.scheme}://{parsed_target.netloc}/oembed/"
             query_url = oembed_base + "?url=" + requests.utils.quote(target_url, safe="") + "&format=json"
             try:
-                oembed_resp = _request_with_retry(self.session, query_url, timeout=15)
+                oembed_resp = _request_with_retry(self.session, query_url,
+                                                   timeout=8, max_retries=1,
+                                                   retry_delays=SCAN_RETRY_DELAYS)
                 data = oembed_resp.json()
                 oembed_candidates = [data.get("url"), data.get("thumbnail_url")]
                 oembed_url = query_url
@@ -643,7 +737,10 @@ class DownloadBackend:
                 return images
 
         try:
-            resp = _request_with_retry(self.session, page_url, timeout=15)
+            _kw = ({"timeout": 10, "max_retries": SCAN_MAX_RETRIES,
+                    "retry_delays": SCAN_RETRY_DELAYS}
+                   if self._in_scan else {"timeout": 15})
+            resp = _request_with_retry(self.session, page_url, **_kw)
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
 
@@ -710,7 +807,10 @@ class DownloadBackend:
 
     def _download_images(self, images, album_title, global_offset=0, global_total=None):
         safe_title = sanitize_dirname(album_title, fallback="album")
-        save_dir = os.path.join(self.base_dir, safe_title)
+        if self._batch_name and sanitize_dirname(self._batch_name) != safe_title:
+            save_dir = os.path.join(self.base_dir, sanitize_dirname(self._batch_name), safe_title)
+        else:
+            save_dir = os.path.join(self.base_dir, safe_title)
 
         try:
             os.makedirs(save_dir, exist_ok=True)
@@ -784,8 +884,10 @@ class DownloadBackend:
             fallback_name = os.path.basename(urlparse(img_url).path) or f"image_{idx}.jpg"
             filename = sanitize_filename(img.get("filename") or fallback_name, fallback=f"image_{idx}.jpg")
 
-            time.sleep(DOWNLOAD_DELAY)
+            time.sleep(BUNKR_DOWNLOAD_DELAY if bunkr_mode else DOWNLOAD_DELAY)
             last_err = None
+            filepath_tmp = os.path.join(save_dir, f"{filename}.{idx}.tmp")
+            bytes_resume = 0  # how many bytes already in tmp (for Range resume)
             for attempt in range(MAX_RETRIES + 1):
                 if self.is_cancelled():
                     return
@@ -793,33 +895,44 @@ class DownloadBackend:
                     req_headers = {}
                     if "scdn.st" in img_url or "get.bunkrr." in img_url:
                         req_headers["Referer"] = "https://bunkr.cr/"
+                    if bytes_resume > 0:
+                        req_headers["Range"] = f"bytes={bytes_resume}-"
                     r = self.session.get(img_url, headers=req_headers, timeout=60, stream=True)
                     if r.status_code == 429:
                         delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                         time.sleep(delay)
                         continue
+                    # 416 = Range not satisfiable → file fully downloaded already
+                    if r.status_code == 416:
+                        bytes_resume = os.path.getsize(filepath_tmp) if os.path.exists(filepath_tmp) else 0
+                        break
                     r.raise_for_status()
 
                     content_length = int(r.headers.get("Content-Length", 0) or 0)
-                    self.file_progress_cb(filename, 0, content_length)
+                    total_size = bytes_resume + content_length if content_length else 0
+                    self.file_progress_cb(filename, bytes_resume, total_size)
 
-                    # Download to a temp file; compute MD5 inline
-                    filepath_tmp = os.path.join(save_dir, f"{filename}.{idx}.tmp")
-                    bytes_written = 0
+                    # Download to a temp file (append if resuming)
+                    file_mode = "ab" if bytes_resume > 0 else "wb"
+                    bytes_written = bytes_resume
                     last_cb_time = 0.0
-                    h = hashlib.md5()
-                    with open(filepath_tmp, "wb") as f:
+                    with open(filepath_tmp, file_mode) as f:
                         for chunk in r.iter_content(65536):
                             if self.is_cancelled():
                                 break
                             f.write(chunk)
-                            h.update(chunk)
                             bytes_written += len(chunk)
-                            if content_length > 0:
+                            if total_size > 0:
                                 now = time.monotonic()
                                 if now - last_cb_time >= 0.12:
-                                    self.file_progress_cb(filename, bytes_written, content_length)
+                                    self.file_progress_cb(filename, bytes_written, total_size)
                                     last_cb_time = now
+                    # Compute MD5 from full file (needed after resume)
+                    h = hashlib.md5()
+                    with open(filepath_tmp, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            h.update(chunk)
+                    bytes_written = os.path.getsize(filepath_tmp)
 
                     if self.is_cancelled():
                         try:
@@ -866,10 +979,19 @@ class DownloadBackend:
                         self.image_downloaded_cb(filepath)
                     last_err = None
                     break
+                except requests.exceptions.ChunkedEncodingError as e:
+                    # Connection dropped mid-stream — keep tmp file and resume
+                    last_err = e
+                    bytes_resume = os.path.getsize(filepath_tmp) if os.path.exists(filepath_tmp) else 0
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                        self.logger(f"⚠ [{idx}/{total}] Обрыв на {format_size(bytes_resume)}, повтор {attempt+1}/{MAX_RETRIES}…")
+                        time.sleep(delay)
                 except Exception as e:
                     last_err = e
+                    bytes_resume = 0
                     try:
-                        os.remove(os.path.join(save_dir, f"{filename}.{idx}.tmp"))
+                        os.remove(filepath_tmp)
                     except OSError:
                         pass
                     if attempt < MAX_RETRIES:
@@ -884,8 +1006,8 @@ class DownloadBackend:
                     self.progress_cb(global_offset + completed, effective_total)
                 self.logger(f"❌ [{idx}/{total}] {last_err}")
 
-        # Use 1 worker for bunkr (each file needs a pre-fetch of the /f/ page)
-        bunkr_mode = bool(images and is_bunkr_file_page(images[0].get("url", "")))
+        # Bunkr: строго 1 поток + пауза между файлами (защита от бана)
+        bunkr_mode = any(is_bunkr_file_page(img.get("url", "")) for img in images)
         effective_workers = 1 if bunkr_mode else self.workers
         with ThreadPoolExecutor(max_workers=effective_workers) as pool:
             futures = [pool.submit(_download_one, (i, img)) for i, img in enumerate(images, 1)]
@@ -978,25 +1100,49 @@ class DownloadBackend:
             self.status_cb("Нет валидных URL")
             return []
 
+        self._in_scan = True
         results = []
-        for i, url in enumerate(clean_urls, 1):
+        completed_count = [0]
+
+        def _scan_one(indexed_url):
+            idx, url = indexed_url
             if self.is_cancelled():
-                break
-            self.status_cb(f"Сканирую {i}/{total}…")
-            self.logger(f"🔍 [{i}/{total}] {url}")
+                return None
+            self.logger(f"🔍 [{idx}/{total}] {url}")
             try:
                 album_title, images = self._resolve_images_for_url(url)
-                results.append((album_title, images))
                 for img in images:
                     if self.is_cancelled():
                         break
                     image_found_cb(album_title, img)
+                return album_title, images
             except Exception as e:
                 self._log_exception(e, "scan_for_preview", f"url={url}")
                 self.logger(f"❌ Ошибка при сканировании: {e}")
+                return None
+
+        # Use limited concurrency to avoid triggering server rate limiting (503).
+        # 5 parallel requests is empirically safe for jpg6.su-type mirrors.
+        scan_workers = min(self.workers, 5)
+        with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+            futures = {pool.submit(_scan_one, (i, url)): url
+                       for i, url in enumerate(clean_urls, 1)}
+            for future in as_completed(futures):
+                if self.is_cancelled():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                completed_count[0] += 1
+                self.status_cb(f"Сканирую {completed_count[0]}/{total}…")
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    self._log_exception(e, "scan_for_preview:future")
 
         total_found = sum(len(imgs) for _, imgs in results)
         self.status_cb(f"Сканирование завершено: {total_found} изображений")
+        self._in_scan = False
         return results
 
     def download_selected(self, selected):
