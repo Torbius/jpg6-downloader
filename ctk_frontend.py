@@ -124,7 +124,7 @@ I18N: dict[str, dict[str, str]] = {
         "invalid_url":         "Invalid URL \u2014 must start with http",
         "queued_count":        "In queue: {count}",
         "queue_cleared":       "Queue cleared",
-        "import_file_dialog":  "Select TXT file with URLs",
+        "import_file_dialog":  "Select TXT files with URLs",
         "imported_count":      "Imported {count} URLs \u2014 click Scan",
         "backend_running":     "Already running \u2014 please wait",
         "queue_empty":         "Queue is empty \u2014 add URLs first",
@@ -174,7 +174,7 @@ I18N: dict[str, dict[str, str]] = {
         "invalid_url":         "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 URL \u2014 \u0434\u043e\u043b\u0436\u0435\u043d \u043d\u0430\u0447\u0438\u043d\u0430\u0442\u044c\u0441\u044f \u0441 http",
         "queued_count":        "\u0412 \u043e\u0447\u0435\u0440\u0435\u0434\u0438: {count}",
         "queue_cleared":       "\u041e\u0447\u0435\u0440\u0435\u0434\u044c \u043e\u0447\u0438\u0449\u0435\u043d\u0430",
-        "import_file_dialog":  "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 TXT-\u0444\u0430\u0439\u043b \u0441\u043e \u0441\u0441\u044b\u043b\u043a\u0430\u043c\u0438",
+        "import_file_dialog":  "Выберите TXT-файлы со ссылками",
         "imported_count":      "\u0418\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} URL \u2014 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u0421\u043a\u0430\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c",
         "backend_running":     "\u0423\u0436\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u043e",
         "queue_empty":         "\u041e\u0447\u0435\u0440\u0435\u0434\u044c \u043f\u0443\u0441\u0442\u0430 \u2014 \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 URL",
@@ -227,7 +227,7 @@ class PreviewWorker:
     """Thread that scans URLs for preview images."""
 
     def __init__(self, urls, base_dir, workers, batch_name=None,
-                 image_found_cb=None, status_cb=None, finished_cb=None):
+                 image_found_cb=None, status_cb=None, finished_cb=None, log_cb=None):
         self.urls           = list(urls)
         self.base_dir       = base_dir
         self.workers        = workers
@@ -235,6 +235,7 @@ class PreviewWorker:
         self.image_found_cb = image_found_cb
         self.status_cb      = status_cb
         self.finished_cb    = finished_cb
+        self.log_cb         = log_cb
         self.backend        = None
         self._thread: threading.Thread | None = None
 
@@ -245,7 +246,8 @@ class PreviewWorker:
     def _run(self):
         count = [0]
         self.backend = DownloadBackend(
-            base_dir=self.base_dir, workers=self.workers, status_cb=self.status_cb,
+            base_dir=self.base_dir, workers=self.workers,
+            status_cb=self.status_cb, logger=self.log_cb,
         )
 
         def _cb(album_title, img):
@@ -275,12 +277,13 @@ class PreviewWorker:
 class DownloadWorker:
     """Thread that downloads selected images."""
 
-    def __init__(self, selected, base_dir, workers,
+    def __init__(self, selected, base_dir, workers, batch_name=None,
                  log_cb=None, status_cb=None, progress_cb=None,
                  finished_cb=None, file_progress_cb=None):
         self.selected         = selected
         self.base_dir         = base_dir
         self.workers          = workers
+        self.batch_name       = batch_name
         self.log_cb           = log_cb
         self.status_cb        = status_cb
         self.progress_cb      = progress_cb
@@ -299,6 +302,8 @@ class DownloadWorker:
             logger=self.log_cb, status_cb=self.status_cb, progress_cb=self.progress_cb,
             file_progress_cb=self.file_progress_cb,
         )
+        if self.batch_name:
+            self.backend._batch_name = self.batch_name
         summary = self.backend.download_selected(self.selected)
         if self.finished_cb:
             self.finished_cb(summary)
@@ -339,12 +344,14 @@ class CdnThumbnailLoader:
 
 # ── Thumbnail card ─────────────────────────────────────────────────────────────
 class ThumbnailCard(ctk.CTkFrame):
-    """Gallery card: image (aspect-ratio preserved) + filename label + checkbox."""
+    """Gallery card: image (aspect-ratio preserved) + hover overlay + checkbox."""
 
     _PLACEHOLDER_COLOR = "#211640"
+    _OVERLAY_BG        = "#0d0b18"
 
     def __init__(self, parent, album_title: str, url: str,
-                 filename: str, thumb_url: str, thumb_size: int = 120, **kw):
+                 filename: str, thumb_url: str, thumb_size: int = 160,
+                 check_cb=None, **kw):
         super().__init__(
             parent, fg_color=C_CARD, corner_radius=R,
             border_width=2, border_color=C_ACC1, **kw,
@@ -354,39 +361,53 @@ class ThumbnailCard(ctk.CTkFrame):
         self.filename    = filename
         self.thumb_url   = thumb_url
         self.thumb_size  = thumb_size
+        self._check_cb   = check_cb or (lambda: None)
         self._pil_image: Image.Image | None = None
         self._tk_image: ImageTk.PhotoImage | None = None
         self._checked    = True
+        self._hide_job: str | None = None
         self._build()
 
     def _build(self):
         s = self.thumb_size
         self.configure(width=s + 16)
 
-        # Use plain tk.Label + ImageTk.PhotoImage instead of CTkLabel/CTkImage:
-        # CTkImage re-applies DPI scaling on every paint (causing smear/stripes
-        # while scrolling). ImageTk.PhotoImage is a static, pre-scaled bitmap.
         scale = self._get_widget_scaling() if hasattr(self, "_get_widget_scaling") else 1.0
         self._phys_size = max(1, int(round(s * scale)))
         placeholder = Image.new("RGB", (self._phys_size, self._phys_size), self._PLACEHOLDER_COLOR)
         self._tk_image = ImageTk.PhotoImage(placeholder)
-        # plain tk.Label (no CTk overhead per redraw)
-        self._img_label = tk.Label(
-            self, image=self._tk_image, text="", bd=0, highlightthickness=0,
-            bg=C_CARD, cursor="hand2",
+
+        # Fixed-size container for image + hover overlay
+        self._img_frame = tk.Frame(
+            self, bg=self._PLACEHOLDER_COLOR, width=s, height=s,
         )
-        self._img_label.pack(padx=8, pady=(8, 2))
+        self._img_frame.pack(padx=8, pady=8)
+        self._img_frame.pack_propagate(False)
+
+        # Image label fills the container
+        self._img_label = tk.Label(
+            self._img_frame, image=self._tk_image, text="", bd=0,
+            highlightthickness=0, bg=self._PLACEHOLDER_COLOR, cursor="hand2",
+        )
+        self._img_label.place(x=0, y=0, relwidth=1, relheight=1)
         self._img_label.bind("<Button-1>", self._on_click)
 
-        short = (self.filename or os.path.basename(self.url))
-        if len(short) > 22:
-            short = short[:19] + "\u2026"
-        self._name_label = ctk.CTkLabel(
-            self, text=short, font=FONT_SM, text_color=C_MUTED,
-            fg_color="transparent", wraplength=s,
+        # Filename overlay label — placed at bottom of _img_frame on hover
+        full_name = self.filename or os.path.basename(self.url)
+        self._name_overlay = tk.Label(
+            self._img_frame, text=full_name, bg=self._OVERLAY_BG, fg="#f0eeff",
+            font=("Inter", 9), anchor="w", padx=4, pady=2,
+            wraplength=max(60, self.thumb_size - 8),
+            justify="left",
         )
-        self._name_label.pack(padx=4, pady=(0, 8))
-        self._name_label.bind("<Button-1>", self._on_click)
+        # not placed initially — shown on hover
+
+        # Hover bindings on all visible surfaces
+        for w in (self._img_label, self._img_frame, self._name_overlay):
+            w.bind("<Enter>",  self._on_hover_enter, add="+")
+            w.bind("<Leave>",  self._on_hover_leave, add="+")
+        self._img_frame.bind("<Button-1>", self._on_click)
+        self._name_overlay.bind("<Button-1>", self._on_click)
 
         self._check_var = ctk.BooleanVar(value=True)
         self._checkbox = ctk.CTkCheckBox(
@@ -397,6 +418,32 @@ class ThumbnailCard(ctk.CTkFrame):
         )
         self._checkbox.place(relx=1.0, rely=0.0, anchor="ne", x=-5, y=5)
 
+    # ── hover handlers ────────────────────────────────────────────────────────
+    def _on_hover_enter(self, _e=None):
+        # Cancel any pending hide
+        if self._hide_job is not None:
+            self.after_cancel(self._hide_job)
+            self._hide_job = None
+        self._name_overlay.place(relx=0, rely=1.0, relwidth=1, anchor="sw")
+
+    def _on_hover_leave(self, _e=None):
+        # Delay slightly so moving between child widgets doesn't flicker
+        if self._hide_job is not None:
+            self.after_cancel(self._hide_job)
+        self._hide_job = self.after(80, self._do_hide)
+
+    def _do_hide(self):
+        self._hide_job = None
+        # Only hide if pointer is truly outside the card frame
+        try:
+            px, py = self.winfo_pointerxy()
+            rx, ry = self.winfo_rootx(), self.winfo_rooty()
+            if rx <= px <= rx + self.winfo_width() and ry <= py <= ry + self.winfo_height():
+                return
+        except Exception:
+            pass
+        self._name_overlay.place_forget()
+
     def _on_click(self, _e=None):
         self._check_var.set(not self._check_var.get())
         self._on_checkbox_change()
@@ -404,6 +451,7 @@ class ThumbnailCard(ctk.CTkFrame):
     def _on_checkbox_change(self):
         self._checked = self._check_var.get()
         self.configure(border_color=C_ACC1 if self._checked else C_BORDER)
+        self._check_cb()
 
     # ── public API ────────────────────────────────────────────────────────────
     def set_image(self, pil_img: Image.Image):
@@ -429,6 +477,7 @@ class ThumbnailCard(ctk.CTkFrame):
     def resize_thumb(self, new_size: int):
         self.thumb_size = new_size
         self.configure(width=new_size + 16)
+        self._img_frame.configure(width=new_size, height=new_size)
         scale = self._get_widget_scaling() if hasattr(self, "_get_widget_scaling") else 1.0
         self._phys_size = max(1, int(round(new_size * scale)))
         if self._pil_image:
@@ -443,13 +492,14 @@ class ThumbnailCard(ctk.CTkFrame):
 class GalleryFrame(ctk.CTkScrollableFrame):
     """Responsive grid gallery with mousewheel scroll fix."""
 
-    def __init__(self, parent, thumb_size: int = 120, **kw):
+    def __init__(self, parent, thumb_size: int = 160, on_check_changed=None, **kw):
         super().__init__(
             parent, fg_color=C_SURF,
             scrollbar_button_color=C_BORDER,
             scrollbar_button_hover_color=C_ACC1,
             corner_radius=R, **kw,
         )
+        self._on_check_changed = on_check_changed or (lambda: None)
         self.thumb_size = thumb_size
         self._cards: list[ThumbnailCard] = []
         self._cols  = 5
@@ -487,7 +537,8 @@ class GalleryFrame(ctk.CTkScrollableFrame):
     # ── card management ───────────────────────────────────────────────────────
     def add_card(self, album_title, url, filename, thumb_url) -> ThumbnailCard:
         card = ThumbnailCard(
-            self, album_title, url, filename, thumb_url, thumb_size=self.thumb_size,
+            self, album_title, url, filename, thumb_url,
+            thumb_size=self.thumb_size, check_cb=self._on_check_changed,
         )
         self._cards.append(card)
         idx  = len(self._cards) - 1
@@ -505,6 +556,7 @@ class GalleryFrame(ctk.CTkScrollableFrame):
     def set_all_checked(self, value: bool):
         for card in self._cards:
             card.set_checked(value)
+        self._on_check_changed()
 
     def get_selected(self) -> list[tuple]:
         return [
@@ -563,7 +615,8 @@ class DownloaderCtkWindow(ctk.CTk):
         self._worker: PreviewWorker | DownloadWorker | None = None
         self._batch_name: str | None = None
         self._queued_urls: list[str] = []
-        self._thumb_size: int        = 120
+        self._queued_set:  set[str]  = set()
+        self._thumb_size: int        = 160
         self._log_job_id             = None
         self._pending_cards: list    = []
         self._flush_job: str | None  = None
@@ -716,6 +769,7 @@ class DownloaderCtkWindow(ctk.CTk):
         tab = ctk.CTkFrame(c, fg_color=C_CARD, corner_radius=R)
         tab.grid(row=0, column=0, padx=16, pady=(14, 8), sticky="ew")
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=0)
 
         inner = ctk.CTkFrame(tab, fg_color="transparent")
         inner.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
@@ -781,6 +835,16 @@ class DownloaderCtkWindow(ctk.CTk):
         )
         self._btn_clear_q.grid(row=0, column=6)
 
+        # ── queue panel (inside tab, row 1) — scrollable list of queued URLs ──
+        self._queue_panel = ctk.CTkScrollableFrame(
+            tab, height=80, fg_color=C_SURF, corner_radius=8,
+            scrollbar_button_color=C_BORDER,
+            scrollbar_button_hover_color=C_ACC1,
+        )
+        self._queue_panel.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="ew")
+        self._queue_panel.grid_columnconfigure(0, weight=1)
+        self._queue_panel.grid_remove()   # hidden until queue has entries
+
         # ── row 1: gallery toolbar ────────────────────────────────────────────
         gth = ctk.CTkFrame(c, fg_color="transparent")
         gth.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="ew")
@@ -788,7 +852,12 @@ class DownloaderCtkWindow(ctk.CTk):
         self._lbl_gallery = ctk.CTkLabel(
             gth, text="", font=("Inter", 12, "bold"), text_color=C_MUTED,
         )
-        self._lbl_gallery.pack(side="left", padx=(2, 14))
+        self._lbl_gallery.pack(side="left", padx=(2, 6))
+
+        self._lbl_gallery_count = ctk.CTkLabel(
+            gth, text="", font=FONT_SM, text_color=C_ACC2,
+        )
+        self._lbl_gallery_count.pack(side="left", padx=(0, 10))
 
         self._btn_sel_all = ctk.CTkButton(
             gth, text="", width=108, height=28, corner_radius=8,
@@ -832,7 +901,10 @@ class DownloaderCtkWindow(ctk.CTk):
         self._btn_clear_gal.pack(side="left", padx=(6, 0))
 
         # ── row 2: gallery ────────────────────────────────────────────────────
-        self.gallery = GalleryFrame(c, thumb_size=self._thumb_size)
+        self.gallery = GalleryFrame(
+            c, thumb_size=self._thumb_size,
+            on_check_changed=lambda: self.after(0, self._update_gallery_count),
+        )
         self.gallery.grid(row=2, column=0, padx=16, pady=(0, 8), sticky="nsew")
 
         # ── row 3: bottom action bar ──────────────────────────────────────────
@@ -1037,11 +1109,13 @@ class DownloaderCtkWindow(ctk.CTk):
         if len(lines) > 1:
             added = 0
             for line in lines:
-                if line not in self._queued_urls:
+                if line not in self._queued_set:
                     self._queued_urls.append(line)
+                    self._queued_set.add(line)
                     added += 1
             self._url_var.set("")
             self._set_status(self._t("pasted_multi", count=added))
+            self._rebuild_queue_panel()
         elif len(lines) == 1:
             self._url_var.set(lines[0])
             try:
@@ -1112,39 +1186,100 @@ class DownloaderCtkWindow(ctk.CTk):
         if not url.startswith("http"):
             self._set_status(self._t("invalid_url"))
             return
-        if url not in self._queued_urls:
+        if url not in self._queued_set:
             self._queued_urls.append(url)
+            self._queued_set.add(url)
         self._url_var.set("")
         self._set_status(self._t("queued_count", count=len(self._queued_urls)))
+        self._rebuild_queue_panel()
 
     def clear_queue(self):
         self._queued_urls.clear()
+        self._queued_set.clear()
         self._batch_name = None
         self._progress.set(0.0)
         self._set_status(self._t("queue_cleared"))
+        self._rebuild_queue_panel()
 
     def import_urls(self):
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             title=self._t("import_file_dialog"),
             initialdir=SCRIPT_DIR,
             filetypes=[("Text files", "*.txt")],
             parent=self,
         )
-        if not path:
+        if not paths:
             return
-        self._batch_name = os.path.splitext(os.path.basename(path))[0]
+        # batch_name: single file → use filename; multiple → None (no shared name)
+        if len(paths) == 1:
+            self._batch_name = os.path.splitext(os.path.basename(paths[0]))[0]
+        else:
+            self._batch_name = None
         added = 0
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line.startswith("http"):
-                    continue
-                if line not in self._queued_urls:
-                    self._queued_urls.append(line)
-                added += 1
+        for path in paths:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line.startswith("http"):
+                        continue
+                    if line not in self._queued_set:
+                        self._queued_urls.append(line)
+                        self._queued_set.add(line)
+                    added += 1
         self._set_status(self._t("imported_count", count=added))
+        self._rebuild_queue_panel()
 
-    # ── Gallery helpers ───────────────────────────────────────────────────────
+    # ── Queue panel ───────────────────────────────────────────────────────────
+    def _rebuild_queue_panel(self):
+        """Re-render the queue URL list. Shows panel when queue non-empty, hides when empty."""
+        # Destroy all children
+        for widget in self._queue_panel.winfo_children():
+            widget.destroy()
+
+        if not self._queued_urls:
+            self._queue_panel.grid_remove()
+            return
+
+        self._queue_panel.grid()
+        MAX_DISPLAY = 50
+        display_urls = self._queued_urls[:MAX_DISPLAY]
+
+        for i, url in enumerate(display_urls):
+            row_frame = ctk.CTkFrame(self._queue_panel, fg_color="transparent")
+            row_frame.grid(row=i, column=0, sticky="ew", padx=2, pady=1)
+            row_frame.grid_columnconfigure(0, weight=1)
+
+            # Truncate long URLs for display
+            display_text = url if len(url) <= 80 else url[:77] + "…"
+            ctk.CTkLabel(
+                row_frame, text=display_text, font=FONT_SM, text_color=C_MUTED,
+                fg_color="transparent", anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=(4, 4))
+
+            ctk.CTkButton(
+                row_frame, text="×", width=24, height=20, corner_radius=6,
+                fg_color=C_BORDER, hover_color=C_STOP,
+                text_color="#ffffff", font=("Inter", 12, "bold"),
+                command=lambda u=url: self._remove_queued_url(u),
+            ).grid(row=0, column=1, padx=(0, 2))
+
+        extra = len(self._queued_urls) - MAX_DISPLAY
+        if extra > 0:
+            ctk.CTkLabel(
+                self._queue_panel,
+                text=f"… и ещё {extra}",
+                font=FONT_SM, text_color=C_MUTED, fg_color="transparent", anchor="w",
+            ).grid(row=MAX_DISPLAY, column=0, sticky="ew", padx=6, pady=(0, 2))
+
+    def _remove_queued_url(self, url: str):
+        """Remove a single URL from the queue and refresh the panel."""
+        try:
+            self._queued_urls.remove(url)
+        except ValueError:
+            pass
+        self._queued_set.discard(url)
+        self._set_status(self._t("queued_count", count=len(self._queued_urls)))
+        self._rebuild_queue_panel()
     def _set_thumb_size(self, size: int):
         self._thumb_size = size
         self.gallery.set_thumb_size(size)
@@ -1162,6 +1297,15 @@ class DownloaderCtkWindow(ctk.CTk):
         self.gallery.clear()
         self.gallery.scroll_to_top()
         self._btn_start.configure(state="disabled")
+        self._update_gallery_count()
+
+    def _update_gallery_count(self):
+        total    = self.gallery.count()
+        selected = sum(1 for c in self.gallery._cards if c.is_checked())
+        if total == 0:
+            self._lbl_gallery_count.configure(text="")
+        else:
+            self._lbl_gallery_count.configure(text=f"{selected} / {total}")
 
     # ── Scan workflow ─────────────────────────────────────────────────────────
     def start_scan(self):
@@ -1186,14 +1330,21 @@ class DownloaderCtkWindow(ctk.CTk):
         self._set_ui_busy(True)
         self._set_status(self._t("starting_scan"))
 
+        urls_to_scan = list(self._queued_urls)
+        # Hide the queue panel once scan is launched — gallery takes over
+        self._queued_urls.clear()
+        self._queued_set.clear()
+        self._rebuild_queue_panel()
+
         self._worker = PreviewWorker(
-            list(self._queued_urls), base_dir, workers,
+            urls_to_scan, base_dir, workers,
             batch_name=self._batch_name,
             image_found_cb=lambda at, u, fn, tu: self.after(
                 0, lambda at=at, u=u, fn=fn, tu=tu: self._on_image_found(at, u, fn, tu),
             ),
             status_cb=lambda txt: self.after(0, lambda t=txt: self._set_status(t)),
             finished_cb=lambda cnt: self.after(0, lambda c=cnt: self._on_scan_finished(c)),
+            log_cb=lambda msg: self.after(0, lambda m=msg: self._append_engine_log(m)),
         )
         self._worker.start()
 
@@ -1215,6 +1366,7 @@ class DownloaderCtkWindow(ctk.CTk):
             ).start()
         if self._pending_cards:
             self._flush_job = self.after(80, self._flush_cards)
+        self._update_gallery_count()
 
     def _on_scan_finished(self, count: int):
         self._progress.stop()
@@ -1225,6 +1377,7 @@ class DownloaderCtkWindow(ctk.CTk):
         if count > 0:
             self._btn_start.configure(state="normal")
         self._set_status(self._t("scan_done", count=count))
+        self._update_gallery_count()
 
     # ── Download workflow ─────────────────────────────────────────────────────
     def start_download_selected(self):
@@ -1248,6 +1401,7 @@ class DownloaderCtkWindow(ctk.CTk):
 
         self._worker = DownloadWorker(
             selected, base_dir, workers,
+            batch_name=self._batch_name,
             log_cb=lambda msg: self.after(0, lambda m=msg: self._append_engine_log(m)),
             status_cb=lambda txt: self.after(0, lambda t=txt: self._set_status(t)),
             progress_cb=lambda d, t: self.after(0, lambda d=d, t=t: self._on_progress(d, t)),
@@ -1328,9 +1482,6 @@ class DownloaderCtkWindow(ctk.CTk):
         size_done = format_size(done)
         size_total = format_size(total)
         name_part = filename[:36].ljust(36) if len(filename) > 36 else filename.ljust(36)
-        if which == "engine":
-            self._engine_progress_line = None
-            self._engine_progress_filename = ""
         msg = f"⬇  {name_part}  {size_done:>9} / {size_total:<9}  [{bar}]  {pct:3d}%"
 
         if done == 0:
