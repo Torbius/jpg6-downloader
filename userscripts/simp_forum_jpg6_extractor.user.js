@@ -1,24 +1,35 @@
 // ==UserScript==
 // @name         Simp Forum JPG6 Extractor
 // @namespace    https://local.jpg6.downloader
-// @version      0.3.0
-// @description  Собирает оригинальные JPG6 ссылки из темы форума и экспортирует в TXT.
+// @version      0.4.0
+// @description  Собирает JPG6 и Bunkr ссылки из темы форума и экспортирует в TXT.
 // @author       local
 // @run-at       document-end
 // @noframes
 // @grant        none
 // @match        *://simptown.su/*
 // @match        *://*.simptown.su/*
+// @match        *://simpcity.su/*
+// @match        *://*.simpcity.su/*
 // @match        *://simpcity.cr/*
 // @match        *://*.simpcity.cr/*
-// @include      /^https?:\/\/([^/]+\.)?simpcity\.[^/]+\/.*/
+// @match        *://simpcity.is/*
+// @match        *://*.simpcity.is/*
+// @match        *://simpcity.to/*
+// @match        *://*.simpcity.to/*
+// @match        *://simpcity.ph/*
+// @match        *://*.simpcity.ph/*
+// @match        *://simpcity.net/*
+// @match        *://*.simpcity.net/*
+// @include      /^https?:\/\/([^/]+\.)?(simptown|simpcity)\.[^/]+\/.*/
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const HOST_RE = /(^|\.)simptown\.su$|(^|\.)simpcity\.[a-z0-9.-]+$/i;
+  const HOST_RE = /(^|\.)simp(town|city)\.[a-z0-9.-]+$/i;
   const JPG_HOST_RE = /(^|\.)(jpg\d*\.(su|church|fish|fishing|pet|cr)|jpeg\d*\.(su|pet|cr)|selti-delivery\.ru)$/i;
+  const BUNKR_HOST_RE = /^(bunkrr?)\.[a-z]{2,10}$/i;
   const URL_TEXT_RE = /https?:\/\/[^\s"'<>`]+/gi;
   const URL_IN_HTML_RE = /https?:\\?\/\\?\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/gi;
   const POST_ROOT_SELECTOR = [
@@ -62,9 +73,23 @@
   }
 
   const state = {
-    links: new Set(),
+    imgPageLinks: new Set(),   // /img/TOKEN — jpg mirrors
+    albumLinks:   new Set(),   // album / profile links
+    directImages: new Set(),   // raw CDN image URLs
+    bunkrLinks:   new Set(),   // bunkr album + /f/ file links
+    _seenCdnKeys: new Set(),   // cross-post CDN filename dedup
     running: false,
   };
+
+  // All links union for export
+  function allLinks() {
+    return [
+      ...state.imgPageLinks,
+      ...state.albumLinks,
+      ...state.directImages,
+      ...state.bunkrLinks,
+    ];
+  }
 
   function toAbsoluteUrl(raw, baseUrl) {
     if (!raw || typeof raw !== 'string') return null;
@@ -178,6 +203,35 @@
     }
   }
 
+  function isBunkrHost(urlString) {
+    try { return BUNKR_HOST_RE.test(new URL(urlString).hostname); } catch { return false; }
+  }
+
+  // 'bunkr_album' — /a/ID or /album/ID
+  // 'bunkr_file'  — /f/ID (single file page, resolved to CDN on download)
+  // null          — not a recognised bunkr link
+  function classifyBunkrLink(urlString) {
+    if (!isBunkrHost(urlString)) return null;
+    try {
+      const segs = new URL(urlString).pathname.split('/').filter(Boolean);
+      if (!segs.length) return null;
+      if (segs[0] === 'f') return 'bunkr_file';
+      if (segs[0] === 'a' || segs[0] === 'album') return 'bunkr_album';
+      return null;
+    } catch { return null; }
+  }
+
+  // Canonical key for cross-post CDN dedup: strips numeric CDN subdomain
+  // so img3.jpg6.su/x.jpg and img7.jpg6.su/x.jpg are treated as the same file.
+  function cdnKey(urlString) {
+    try {
+      const u = new URL(urlString);
+      const host = u.hostname.replace(/^[a-z]+\d+\./, '');
+      const path = u.pathname.replace(/\.th\./, '.').replace(/\.md\./, '.');
+      return `${host}${path}`;
+    } catch { return urlString; }
+  }
+
   function getScanRoots(doc) {
     const roots = Array.from(doc.querySelectorAll(POST_ROOT_SELECTOR))
       .filter((el) => !el.closest(NOISE_SELECTOR));
@@ -198,20 +252,43 @@
   }
 
   function collectCandidatesFromDocument(doc, baseUrl) {
-    const allLinks = new Set();
     const roots = getScanRoots(doc);
+    let added = 0;
+
+    function addGlobal(norm, kind) {
+      if (kind === 'img_page') {
+        if (!state.imgPageLinks.has(norm)) { state.imgPageLinks.add(norm); added++; }
+      } else if (kind === 'album_or_profile') {
+        if (!state.albumLinks.has(norm)) { state.albumLinks.add(norm); added++; }
+      } else if (kind === 'direct_image') {
+        // Cross-post CDN dedup: same file on different CDN mirrors → skip
+        const key = cdnKey(norm);
+        if (!state._seenCdnKeys.has(key)) {
+          state._seenCdnKeys.add(key);
+          state.directImages.add(norm);
+          added++;
+        }
+      } else if (kind === 'bunkr_album' || kind === 'bunkr_file') {
+        if (!state.bunkrLinks.has(norm)) { state.bunkrLinks.add(norm); added++; }
+      }
+    }
 
     for (const root of roots) {
-      // Per-post buckets
-      const imgPageLinks = new Set();    // jpg6.su/img/TOKEN — preferred
-      const albumLinks = new Set();      // albums / profiles — always included
-      const directCdnLinks = new Set();  // raw CDN image URLs — only if no /img/ links
+      const imgPageLinks  = new Set();
+      const albumLinks    = new Set();
+      const directCdnLinks = new Set();
+      const bunkrPostLinks = [];  // [{url, kind}]
 
       function processRaw(raw) {
         if (!raw || typeof raw !== 'string') return;
         const abs = toAbsoluteUrl(raw.trim(), baseUrl);
         if (!abs) return;
         const unwrapped = unwrapForumRedirect(abs, baseUrl);
+
+        // Bunkr check first (before jpg-mirror normalisation)
+        const bunkrKind = classifyBunkrLink(unwrapped);
+        if (bunkrKind) { bunkrPostLinks.push({ url: unwrapped, kind: bunkrKind }); return; }
+
         const norm = normalizeJpgUrl(unwrapped);
         const kind = classifyJpgLink(norm);
         if (kind === 'img_page') imgPageLinks.add(norm);
@@ -246,31 +323,32 @@
       for (const m of ((root.innerText || '').match(URL_TEXT_RE) || [])) processRaw(m);
       for (const m of ((root.innerHTML || '').match(URL_IN_HTML_RE) || [])) processRaw(decodeMaybeUrl(m));
 
-      // Preference rule: if this post has /img/ page links, ignore its raw CDN links
-      // (they are the same images, just duplicate embeds by different users in the thread).
-      // If the post has NO /img/ links, keep the raw CDN links (standalone embeds).
-      for (const l of albumLinks) allLinks.add(l);
-      for (const l of imgPageLinks) allLinks.add(l);
+      // Flush per-post to global state
+      for (const l of albumLinks) addGlobal(l, 'album_or_profile');
+      for (const l of imgPageLinks) addGlobal(l, 'img_page');
+      // If post has /img/ links, skip its raw CDN links (same images, duplicate embeds)
       if (imgPageLinks.size === 0) {
-        for (const l of directCdnLinks) allLinks.add(l);
+        for (const l of directCdnLinks) addGlobal(l, 'direct_image');
       }
+      for (const { url, kind } of bunkrPostLinks) addGlobal(url, kind);
     }
 
-    // Script tags are page-global (not per-post).
-    // Only collect /img/ and album links from scripts; skip bare CDN URLs.
+    // Script tags: only /img/, album, bunkr — skip bare CDN URLs
     for (const scriptEl of doc.querySelectorAll('script')) {
       const s = scriptEl.textContent || '';
       for (const m of (s.match(URL_IN_HTML_RE) || [])) {
         const abs = toAbsoluteUrl(decodeMaybeUrl(m), baseUrl);
         if (!abs) continue;
         const unwrapped = unwrapForumRedirect(abs, baseUrl);
+        const bunkrKind = classifyBunkrLink(unwrapped);
+        if (bunkrKind) { addGlobal(unwrapped, bunkrKind); continue; }
         const norm = normalizeJpgUrl(unwrapped);
         const kind = classifyJpgLink(norm);
-        if (kind === 'img_page' || kind === 'album_or_profile') allLinks.add(norm);
+        if (kind === 'img_page' || kind === 'album_or_profile') addGlobal(norm, kind);
       }
     }
 
-    return allLinks;
+    return added;
   }
 
   function threadKey(urlString) {
@@ -365,10 +443,9 @@
   }
 
   async function scanCurrentPage() {
-    const found = collectCandidatesFromDocument(document, location.href);
-    for (const link of found) state.links.add(link);
+    const added = collectCandidatesFromDocument(document, location.href);
     renderCount();
-    return found.size;
+    return added;
   }
 
   async function scanWholeThread() {
@@ -380,7 +457,9 @@
 
     for (let i = 0; i < pageUrls.length; i += 1) {
       const pageUrl = pageUrls[i];
-      setStatus(`Стр. ${i + 1} / ${pageUrls.length}...`);
+      const pct = Math.round(((i + 1) / pageUrls.length) * 100);
+      setStatus(`Стр. ${i + 1} / ${pageUrls.length} (${pct}%)...`);
+      setProgress(pct);
 
       try {
         let doc = document;
@@ -389,10 +468,8 @@
           await sleep(400);
         }
 
-        const found = collectCandidatesFromDocument(doc, pageUrl);
-        const before = state.links.size;
-        for (const link of found) state.links.add(link);
-        totalAdded += state.links.size - before;
+        const added = collectCandidatesFromDocument(doc, pageUrl);
+        totalAdded += added;
         renderCount();
       } catch (err) {
         console.error('[JPG6 Extractor] scan error on', pageUrl, ':', err);
@@ -401,12 +478,15 @@
       }
     }
 
+    setProgress(0);
     renderCount();
     return { pages: pageUrls.length, added: totalAdded };
   }
 
   function linksAsText() {
-    return Array.from(state.links).sort().join('\n');
+    const lines = allLinks();
+    if (!lines.length) return '';
+    return lines.sort().join('\n');
   }
 
   function safeFileName(input) {
@@ -449,7 +529,9 @@
       return;
     }
     await navigator.clipboard.writeText(text);
-    setStatus(`Скопировано ссылок: ${state.links.size}`);
+    const total = state.imgPageLinks.size + state.albumLinks.size +
+                  state.directImages.size + state.bunkrLinks.size;
+    setStatus(`Скопировано ссылок: ${total}`);
   }
 
   function makeButton(label, onClick) {
@@ -470,13 +552,29 @@
 
   let statusEl;
   let countEl;
+  let progressEl;
 
   function setStatus(text) {
     if (statusEl) statusEl.textContent = text;
   }
 
+  function setProgress(pct) {
+    if (progressEl) {
+      progressEl.style.width = pct > 0 ? `${pct}%` : '0%';
+      progressEl.style.display = pct > 0 ? 'block' : 'none';
+    }
+  }
+
   function renderCount() {
-    if (countEl) countEl.textContent = `Найдено: ${state.links.size}`;
+    if (!countEl) return;
+    const img  = state.imgPageLinks.size + state.directImages.size;
+    const alb  = state.albumLinks.size;
+    const bunk = state.bunkrLinks.size;
+    const parts = [];
+    if (img  > 0) parts.push(`${img} фото`);
+    if (alb  > 0) parts.push(`${alb} альб.`);
+    if (bunk > 0) parts.push(`${bunk} bunkr`);
+    countEl.textContent = parts.length ? `Найдено: ${parts.join(' / ')}` : 'Найдено: 0';
   }
 
   function lockUi(flag) {
@@ -509,8 +607,15 @@
   title.style.cssText = 'font-weight:700;font-size:13px;margin-bottom:8px;';
 
   countEl = document.createElement('div');
-  countEl.style.cssText = 'margin-bottom:8px;color:#c8d4e5;';
+  countEl.style.cssText = 'margin-bottom:4px;color:#c8d4e5;';
   countEl.textContent = 'Найдено: 0';
+
+  // Progress bar (hidden by default, shown during scanWholeThread)
+  const progressWrap = document.createElement('div');
+  progressWrap.style.cssText = 'background:#1a2a40;border-radius:4px;height:4px;margin-bottom:8px;overflow:hidden;';
+  progressEl = document.createElement('div');
+  progressEl.style.cssText = 'height:4px;background:#4a90d9;border-radius:4px;width:0%;display:none;transition:width 0.3s;';
+  progressWrap.appendChild(progressEl);
 
   statusEl = document.createElement('div');
   statusEl.style.cssText = 'min-height:16px;margin-top:8px;color:#8fb1d6;';
@@ -560,14 +665,18 @@
 
   const btnClear = makeButton('Очистить', () => {
     if (state.running) return;
-    state.links.clear();
+    state.imgPageLinks.clear();
+    state.albumLinks.clear();
+    state.directImages.clear();
+    state.bunkrLinks.clear();
+    state._seenCdnKeys.clear();
     renderCount();
     setStatus('Очищено');
   });
   btnClear.style.gridColumn = '1 / span 2';
 
   grid.append(btnScanPage, btnScanThread, btnCopy, btnDownload, btnClear);
-  panel.append(title, countEl, grid, statusEl);
+  panel.append(title, countEl, progressWrap, grid, statusEl);
   document.documentElement.appendChild(panel);
 
   setStatus('Готово к сбору');
