@@ -1,7 +1,6 @@
 def main():
-    from ctk_frontend import run_ctk
-    raise SystemExit(run_ctk())
-
+    from fluent_frontend import run_fluent
+    raise SystemExit(run_fluent())
 
 if __name__ == "__main__":
     main()
